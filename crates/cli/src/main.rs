@@ -90,20 +90,23 @@ fn main() -> Result<()> {
         finals: Mutex::new(vec![]), partials: Mutex::new(vec![]) });
     let p = Pipeline::start(cfg, Box::new(asr), Box::new(tr), writer, sink.clone());
     if a.live {
-        use gow_meet_core::capture::{AudioSource, CaptureEvent, MicSource, SystemSource};
+        use gow_meet_core::capture::{AudioSource, CaptureEvent, MicSource, SourceClock, SystemSource};
         use std::sync::atomic::{AtomicBool, Ordering};
         let stop = Arc::new(AtomicBool::new(false));
         { let s = stop.clone(); ctrlc::set_handler(move || s.store(true, Ordering::SeqCst))?; }
         let (tx, rx) = crossbeam_channel::unbounded();
+        // Relógio da sessão: lacunas de entrega viram silêncio, sem atrasar o t0 da fonte.
+        let t0 = Instant::now();
+        let mut clock = SourceClock::default();
         let mut mic = MicSource::new();
         let mut sys = SystemSource::new();
         if let Err(e) = sys.start(tx.clone()) { eprintln!("! áudio do sistema: {e}"); }
         if let Err(e) = mic.start(tx) { sys.stop(); return Err(e); }
         eprintln!("Capturando. Ctrl+C para encerrar.");
-        let t0 = Instant::now();
         while !stop.load(Ordering::SeqCst) {
             match rx.recv_timeout(Duration::from_millis(200)) {
-                Ok(CaptureEvent::Audio { source, samples }) => p.feed(source, &samples),
+                Ok(CaptureEvent::Audio { source, samples }) =>
+                    clock.align(source, t0.elapsed(), &samples, |x| p.feed(source, x)),
                 Ok(CaptureEvent::Reconnecting(s)) => eprintln!("! reconectando {s:?}"),
                 Ok(CaptureEvent::Error { source, message }) => eprintln!("! {source:?}: {message}"),
                 Err(_) => {}

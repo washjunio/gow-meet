@@ -3,6 +3,7 @@ use crate::session::SpeakerSource;
 use anyhow::Result;
 use crossbeam_channel::Sender;
 
+pub mod clock;
 pub mod mic;
 #[cfg(target_os = "macos")]
 pub mod mac;
@@ -10,6 +11,7 @@ pub mod mac;
 pub use mac::SystemSource;
 #[cfg(not(target_os = "macos"))]
 pub use unsupported::SystemSource;
+pub use clock::SourceClock;
 pub use mic::MicSource;
 
 /// Mantém o CI do Windows compilando até a Task 14 implementar o loopback WASAPI.
