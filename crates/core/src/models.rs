@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 pub const DEFAULT_BASE_URL: &str = "https://huggingface.co";
 
@@ -22,12 +23,27 @@ pub trait Fetch {
     fn open(&self, url: &str) -> Result<(Box<dyn Read>, Option<u64>)>;
 }
 
-pub struct HttpFetch;
+/// Download por HTTP com os certificados do sistema (inspeção TLS corporativa) e o
+/// proxy do sistema.
+pub struct HttpFetch {
+    pub connect_timeout: Duration,
+    /// Espera máxima por dados: pelos cabeçalhos e por cada leitura do corpo. No
+    /// cliente bloqueante do reqwest 0.12 o `timeout` vale para cada espera (um prazo
+    /// novo por `read`), não para o download inteiro; uma conexão parada vira erro.
+    pub read_timeout: Duration,
+}
+
+impl Default for HttpFetch {
+    fn default() -> Self {
+        Self { connect_timeout: Duration::from_secs(15), read_timeout: Duration::from_secs(30) }
+    }
+}
 
 impl Fetch for HttpFetch {
     fn open(&self, url: &str) -> Result<(Box<dyn Read>, Option<u64>)> {
         let resp = reqwest::blocking::Client::builder()
-            .timeout(None)
+            .connect_timeout(self.connect_timeout)
+            .timeout(self.read_timeout)
             .build()?
             .get(url)
             .send()?
@@ -59,22 +75,13 @@ pub fn ensure(
         }
         let part = dir.join(format!("{}.part", f.name));
         let url = format!("{}/{}", base_url.trim_end_matches('/'), f.path);
-        let (mut body, total) = fetch.open(&url)?;
-        let mut out = File::create(&part)?;
-        let mut hasher = Sha256::new();
-        let mut buf = vec![0u8; 1 << 16];
-        let mut done = 0u64;
-        loop {
-            let n = body.read(&mut buf)?;
-            if n == 0 { break; }
-            out.write_all(&buf[..n])?;
-            hasher.update(&buf[..n]);
-            done += n as u64;
-            progress(&f.name, done, total);
-        }
-        out.sync_all()?;
-        drop(out);
-        let got = hex::encode(hasher.finalize());
+        let got = match download(fetch, &url, &part, &f.name, progress) {
+            Ok(h) => h,
+            Err(e) => {
+                let _ = fs::remove_file(&part);
+                return Err(e);
+            }
+        };
         if got != f.sha256 {
             let _ = fs::remove_file(&part);
             bail!("hash inválido para {}: esperado {}, obtido {}", f.name, f.sha256, got);
@@ -82,6 +89,28 @@ pub fn ensure(
         fs::rename(&part, &dest)?;
     }
     Ok(dir.to_path_buf())
+}
+
+/// Baixa `url` para `part` e devolve o SHA-256 do conteúdo.
+fn download(
+    fetch: &dyn Fetch, url: &str, part: &Path, name: &str,
+    progress: &mut dyn FnMut(&str, u64, Option<u64>),
+) -> Result<String> {
+    let (mut body, total) = fetch.open(url)?;
+    let mut out = File::create(part)?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 1 << 16];
+    let mut done = 0u64;
+    loop {
+        let n = body.read(&mut buf).with_context(|| format!("download de {name} interrompido"))?;
+        if n == 0 { break; }
+        out.write_all(&buf[..n])?;
+        hasher.update(&buf[..n]);
+        done += n as u64;
+        progress(name, done, total);
+    }
+    out.sync_all()?;
+    Ok(hex::encode(hasher.finalize()))
 }
 
 #[cfg(test)]
@@ -147,6 +176,61 @@ mod tests {
         std::fs::write(dir.path().join("m.bin"), b"corrompido").unwrap();
         ensure(&spec(sha(b"modelo")), "https://hf.test", dir.path(), &fetch(), &mut |_, _, _| {}).unwrap();
         assert_eq!(std::fs::read(dir.path().join("m.bin")).unwrap(), b"modelo");
+    }
+
+    /// Corpo que entrega alguns bytes e depois falha (conexão caída).
+    struct Broken(usize);
+    impl Read for Broken {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.0 == 0 { return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "parado")); }
+            self.0 -= 1;
+            buf[0] = b'x';
+            Ok(1)
+        }
+    }
+    struct BrokenFetch;
+    impl Fetch for BrokenFetch {
+        fn open(&self, _url: &str) -> Result<(Box<dyn Read>, Option<u64>)> {
+            Ok((Box::new(Broken(3)), Some(100)))
+        }
+    }
+
+    #[test]
+    fn interrupted_download_fails_and_leaves_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = ensure(&spec(sha(b"modelo")), "https://hf.test", dir.path(), &BrokenFetch, &mut |_, _, _| {});
+        assert!(format!("{:#}", err.unwrap_err()).contains("interrompido"));
+        assert!(std::fs::read_dir(dir.path()).unwrap().next().is_none());
+    }
+
+    /// Servidor local que manda os cabeçalhos e 3 bytes e então para de responder.
+    fn stalled_server() -> (String, std::thread::JoinHandle<()>) {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        let h = std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            let mut req = [0u8; 1024];
+            let _ = s.read(&mut req);
+            let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nabc");
+            let _ = s.flush();
+            std::thread::sleep(Duration::from_secs(3));
+        });
+        (url, h)
+    }
+
+    #[test]
+    fn stalled_http_download_times_out() {
+        let (url, server) = stalled_server();
+        let dir = tempfile::tempdir().unwrap();
+        let fetch = HttpFetch { connect_timeout: Duration::from_secs(2), read_timeout: Duration::from_millis(300) };
+        let t0 = std::time::Instant::now();
+        let mut seen = 0;
+        let err = ensure(&spec(sha(b"modelo")), &url, dir.path(), &fetch, &mut |_, d, _| seen = d);
+        assert!(err.is_err());
+        assert!(t0.elapsed() < Duration::from_secs(2), "demorou {:?}", t0.elapsed());
+        assert_eq!(seen, 3);
+        assert!(std::fs::read_dir(dir.path()).unwrap().next().is_none());
+        server.join().unwrap();
     }
 
     #[test]
