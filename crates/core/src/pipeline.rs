@@ -175,11 +175,24 @@ impl Pipeline {
     }
 }
 
+/// Avisos de pânico: genéricos, nunca com o conteúdo da fala.
+pub const ASR_PANIC_MESSAGE: &str =
+    "O reconhecimento de fala parou por um erro interno. Encerre e inicie a reunião de novo.";
+pub const TRANSLATE_PANIC_MESSAGE: &str =
+    "A tradução parou por um erro interno; as falas seguem só no original. Encerre e inicie a reunião de novo.";
+
+/// Roda `f` isolando um pânico do Whisper/CTranslate2; `None` se entrou em pânico.
+/// Depois de um pânico o modelo não é chamado de novo (estado interno incerto).
+fn guarded<T>(f: impl FnOnce() -> T) -> Option<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).ok()
+}
+
 fn asr_loop(
     rx: Receiver<AsrJob>, mut asr: Box<dyn Transcriber>, tr_tx: Sender<TJob>,
     store: Arc<Mutex<Option<Store>>>, sink: Arc<dyn Sink>,
     fed: Arc<Mutex<HashMap<SpeakerSource, u64>>>, lag_warn_ms: u64, open: OpenPartials,
 ) {
+    let mut dead = false;
     while let Ok(first) = rx.recv() {
         let mut batch = vec![first];
         batch.extend(rx.try_iter());
@@ -195,9 +208,21 @@ fn asr_loop(
                     if o.remove(&id).is_some() { sink.emit(PipelineEvent::Dropped { id: id.clone() }); }
                 }
             };
-            let raw = match asr.transcribe(&job.audio) {
-                Ok(t) => t,
-                Err(e) => {
+            // Transcritor morto: segue drenando a fila para não acumular áudio.
+            if dead {
+                drop_final(sink.as_ref());
+                continue;
+            }
+            let raw = match guarded(|| asr.transcribe(&job.audio)) {
+                None => {
+                    dead = true;
+                    tracing::error!("pânico na transcrição; reconhecimento desligado nesta sessão");
+                    sink.emit(PipelineEvent::Error(ASR_PANIC_MESSAGE.into()));
+                    drop_final(sink.as_ref());
+                    continue;
+                }
+                Some(Ok(t)) => t,
+                Some(Err(e)) => {
                     tracing::warn!(source = ?job.source, seq = job.seq, "falha na transcrição: {e}");
                     sink.emit(PipelineEvent::Error(format!("falha na transcrição: {e}")));
                     drop_final(sink.as_ref());
@@ -237,6 +262,18 @@ fn translate_loop(
     sink: Arc<dyn Sink>, every: Duration, open: OpenPartials,
 ) {
     let mut last_partial: HashMap<SpeakerSource, Instant> = HashMap::new();
+    let mut dead = false;
+    // Traduz isolando pânicos: o primeiro desliga a tradução e avisa uma vez.
+    let mut translate = |text: &str| -> Option<Result<String>> {
+        if dead { return None; }
+        let r = guarded(|| tr.translate(text));
+        if r.is_none() {
+            dead = true;
+            tracing::error!("pânico na tradução; tradução desligada nesta sessão");
+            sink.emit(PipelineEvent::Error(TRANSLATE_PANIC_MESSAGE.into()));
+        }
+        r
+    };
     while let Ok(first) = rx.recv() {
         let mut batch = vec![first];
         batch.extend(rx.try_iter());
@@ -246,12 +283,13 @@ fn translate_loop(
         for job in batch {
             match job {
                 TJob::Final(mut line) => {
-                    match tr.translate(&line.text) {
-                        Ok(t) => line.translation = Some(t),
-                        Err(e) => {
+                    match translate(&line.text) {
+                        Some(Ok(t)) => line.translation = Some(t),
+                        Some(Err(e)) => {
                             tracing::warn!(id = %line.id, "falha na tradução: {e}");
                             line.translation_error = true;
                         }
+                        None => line.translation_error = true,
                     }
                     if let Some(s) = store.lock().unwrap().as_mut() { s.append(&line, sink.as_ref()); }
                     sink.emit(PipelineEvent::Translated(line));
@@ -265,7 +303,7 @@ fn translate_loop(
         for (src, job) in partials {
             if last_partial.get(&src).is_some_and(|t| t.elapsed() < every) { continue; }
             let TJob::Partial { id, speaker, t0, t1, text } = job else { continue };
-            if let Ok(t) = tr.translate(&text) {
+            if let Some(Ok(t)) = translate(&text) {
                 last_partial.insert(src, Instant::now());
                 // Só emite se a parcial ainda é a mais recente e a fala segue aberta.
                 let o = open.lock().unwrap();
@@ -306,13 +344,18 @@ mod tests {
 
     fn run(asr: &'static str, tr: Box<dyn Translator>, feed: impl FnOnce(&Pipeline))
         -> (tempfile::TempDir, Vec<PipelineEvent>, Vec<Line>) {
+        run_with(Box::new(FakeAsr(asr)), tr, feed)
+    }
+
+    fn run_with(asr: Box<dyn Transcriber>, tr: Box<dyn Translator>, feed: impl FnOnce(&Pipeline))
+        -> (tempfile::TempDir, Vec<PipelineEvent>, Vec<Line>) {
         let root = tempfile::tempdir().unwrap();
         let meta = Meta { v: 1, id: "t".into(), title: "Teste".into(), started: 0, ended: None,
             source_lang: "en".into(), target_lang: "pt".into(), models: Default::default(),
             app_version: "0".into() };
         let writer = SessionWriter::create(root.path(), meta).unwrap();
         let sink = Arc::new(Collect::default());
-        let p = Pipeline::start(PipelineConfig::default(), Box::new(FakeAsr(asr)), tr, writer, sink.clone());
+        let p = Pipeline::start(PipelineConfig::default(), asr, tr, writer, sink.clone());
         feed(&p);
         let md = p.finish(10_000).unwrap();
         let lines = replay(&md.parent().unwrap().join("lines.jsonl")).unwrap();
@@ -355,6 +398,41 @@ mod tests {
         let mut ids: Vec<_> = lines.iter().map(|l| (l.id.clone(), l.speaker.label.clone())).collect();
         ids.sort();
         assert_eq!(ids, vec![("m0".into(), "Você".into()), ("s0".into(), "Participante".into())]);
+    }
+
+    struct PanicAsr;
+    impl Transcriber for PanicAsr {
+        fn transcribe(&mut self, _a: &[f32]) -> Result<String> { panic!("falha simulada no transcritor") }
+    }
+    struct PanicTranslator;
+    impl Translator for PanicTranslator {
+        fn translate(&mut self, _t: &str) -> Result<String> { panic!("falha simulada no tradutor") }
+    }
+
+    fn two_utterances(p: &Pipeline) {
+        for _ in 0..2 { p.feed(SpeakerSource::System, &[tone(1_500), silence(1_000)].concat()); }
+    }
+
+    fn errors(ev: &[PipelineEvent]) -> Vec<String> {
+        ev.iter().filter_map(|e| match e { PipelineEvent::Error(m) => Some(m.clone()), _ => None }).collect()
+    }
+
+    #[test]
+    fn asr_panic_emits_one_generic_error() {
+        let (_d, ev, lines) = run_with(Box::new(PanicAsr), Box::new(Prefix), two_utterances);
+        assert_eq!(errors(&ev), vec![ASR_PANIC_MESSAGE.to_string()]);
+        assert!(!ev.iter().any(|e| matches!(e, PipelineEvent::Final(_))));
+        assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn translator_panic_emits_one_error_and_keeps_originals() {
+        let (_d, ev, lines) = run_with(Box::new(FakeAsr("Hello team.")), Box::new(PanicTranslator),
+                                       two_utterances);
+        assert_eq!(errors(&ev), vec![TRANSLATE_PANIC_MESSAGE.to_string()]);
+        assert_eq!(lines.len(), 2);
+        assert!(lines.iter().all(|l| l.translation_error && l.text == "Hello team."));
+        assert_eq!(ev.iter().filter(|e| matches!(e, PipelineEvent::Translated(_))).count(), 2);
     }
 
     #[test]
