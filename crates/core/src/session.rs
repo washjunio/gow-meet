@@ -114,9 +114,13 @@ pub fn replay(lines_path: &Path) -> Result<Vec<Line>> {
     };
     let mut order: Vec<String> = vec![];
     let mut latest: HashMap<String, Line> = HashMap::new();
-    for raw in BufReader::new(file).lines() {
-        let raw = raw?;
-        let Ok(line) = serde_json::from_str::<Line>(&raw) else {
+    let mut reader = BufReader::new(file);
+    let mut raw = Vec::new();
+    loop {
+        raw.clear();
+        if reader.read_until(b'\n', &mut raw)? == 0 { break; }
+        // Bytes, não `lines()`: uma queda pode cortar um caractere UTF-8 ao meio.
+        let Ok(line) = serde_json::from_slice::<Line>(&raw) else {
             tracing::warn!("registro inválido ignorado em lines.jsonl");
             continue;
         };
@@ -156,10 +160,16 @@ pub fn recover_unfinished(root: &Path, now_ms: u64) -> Result<Vec<PathBuf>> {
         let Ok(bytes) = fs::read(dir.join("meta.json")) else { continue };
         let Ok(mut meta) = serde_json::from_slice::<Meta>(&bytes) else { continue };
         if meta.ended.is_some() { continue; }
-        let lines = replay(&dir.join("lines.jsonl"))?;
-        meta.ended = Some(lines.iter().map(|l| l.t1).max().map_or(now_ms, |t| meta.started + t));
-        close_session(&dir, &meta)?;
-        done.push(dir);
+        // Uma sessão defeituosa não pode impedir a recuperação das demais.
+        // Só o caminho é logado: o conteúdo das falas nunca vai para o log.
+        let result = replay(&dir.join("lines.jsonl")).and_then(|lines| {
+            meta.ended = Some(lines.iter().map(|l| l.t1).max().map_or(now_ms, |t| meta.started + t));
+            close_session(&dir, &meta)
+        });
+        match result {
+            Ok(_) => done.push(dir),
+            Err(e) => tracing::warn!(path = %dir.display(), error = %format!("{e:#}"), "sessão não recuperada"),
+        }
     }
     Ok(done)
 }
@@ -249,6 +259,41 @@ mod tests {
         assert_eq!(m.ended, Some(1_000 + 2_500)); // started + último t1
         assert!(root.path().join("s5/transcript.md").exists());
         assert!(recover_unfinished(root.path(), 99_000).unwrap().is_empty());
+    }
+
+    #[test]
+    fn truncated_multibyte_character_does_not_break_replay() {
+        let root = tempfile::tempdir().unwrap();
+        let mut w = SessionWriter::create(root.path(), meta("s7")).unwrap();
+        w.append(&line("f1", 0, "Olá, equipe.", None)).unwrap();
+        let full = serde_json::to_string(&line("f2", 900, "Olá", None)).unwrap();
+        // Corta logo após o primeiro byte de "á" (2 bytes em UTF-8): queda no meio do caractere.
+        let cut = full.find('á').unwrap() + 1;
+        let path = w.dir().join("lines.jsonl");
+        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all(&full.as_bytes()[..cut]).unwrap();
+        let got = replay(&path).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].id, "f1");
+        let done = recover_unfinished(root.path(), 99_000).unwrap();
+        assert_eq!(done.len(), 1);
+    }
+
+    #[test]
+    fn bad_session_does_not_stop_recovery_of_others() {
+        let root = tempfile::tempdir().unwrap();
+        let mut w = SessionWriter::create(root.path(), meta("good")).unwrap();
+        w.append(&line("f1", 2_000, "Hello team.", None)).unwrap();
+        drop(w);
+        // Sessão ruim: meta válido e sem fim, mas lines.jsonl é um diretório (leitura falha).
+        let bad = SessionWriter::create(root.path(), meta("bad")).unwrap();
+        drop(bad);
+        let bad_dir = root.path().join("bad");
+        std::fs::remove_file(bad_dir.join("lines.jsonl")).unwrap();
+        std::fs::create_dir(bad_dir.join("lines.jsonl")).unwrap();
+        let done = recover_unfinished(root.path(), 99_000).unwrap();
+        assert_eq!(done, vec![root.path().join("good")]);
+        assert!(root.path().join("good/transcript.md").exists());
     }
 
     #[test]
