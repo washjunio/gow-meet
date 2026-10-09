@@ -2,6 +2,7 @@ use super::{AudioSource, CaptureEvent, Converter};
 use crate::session::SpeakerSource;
 use anyhow::{Context, Result};
 use core_media_rs::cm_sample_buffer::CMSampleBuffer;
+use core_media_rs::cm_time::CMTime;
 use crossbeam_channel::Sender;
 use screencapturekit::shareable_content::SCShareableContent;
 use screencapturekit::stream::{
@@ -11,6 +12,8 @@ use screencapturekit::stream::{
 use std::sync::Mutex;
 
 const RATE: u32 = 48_000;
+/// 1/1 s; flags = kCMTimeFlags_Valid.
+const ONE_SECOND: CMTime = CMTime { value: 1, timescale: 1, flags: 1, epoch: 0 };
 
 /// `CFError` não é `Send + Sync`, então não converte direto em `anyhow::Error`.
 fn cf_err<E: std::fmt::Debug>(e: E) -> anyhow::Error { anyhow::anyhow!("configurar captura: {e:?}") }
@@ -66,8 +69,11 @@ impl AudioSource for SystemSource {
             .set_sample_rate(RATE).map_err(cf_err)?
             .set_channel_count(1).map_err(cf_err)?
             .set_excludes_current_process_audio(true).map_err(cf_err)?
+            // Só o áudio é usado: vídeo mínimo (2×2) a 1 quadro por segundo.
             .set_width(2).map_err(cf_err)?
-            .set_height(2).map_err(cf_err)?;
+            .set_height(2).map_err(cf_err)?
+            .set_minimum_frame_interval(&ONE_SECOND).map_err(cf_err)?
+            .set_queue_depth(3).map_err(cf_err)?;
         let mut stream = SCStream::new(&filter, &config);
         stream.add_output_handler(Handler { tx, conv: Mutex::new(Converter::new(RATE, 1)) },
                                   SCStreamOutputType::Audio);
