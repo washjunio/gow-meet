@@ -6,3 +6,9 @@ version.workspace = true
 [dependencies]
 gow-meet-core = { path = "../core" }
 anyhow.workspace = true
+clap = { version = "4", features = ["derive"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+[features]
+vulkan = ["gow-meet-core/vulkan"]
+cuda = ["gow-meet-core/cuda"]
