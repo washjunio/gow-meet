@@ -2,7 +2,7 @@ mod config;
 
 use config::Config;
 use gow_meet_core::asr::WhisperTranscriber;
-use gow_meet_core::capture::{AudioSource, CaptureEvent, MicSource, SystemSource};
+use gow_meet_core::capture::{AudioSource, CaptureEvent, MicSource, SourceClock, SystemSource};
 use gow_meet_core::models::{self, HttpFetch};
 use gow_meet_core::pipeline::{Pipeline, PipelineConfig, PipelineEvent, Sink};
 use gow_meet_core::session::{recover_unfinished, session_id, Line, Meta, SessionWriter, Speaker, SpeakerSource};
@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter, Manager, RunEvent, WindowEvent};
 
 /// Contrato com o front-end: evento `"gow-meet"`, campo `kind` em camelCase.
 #[derive(Debug, Clone, Serialize)]
@@ -84,8 +84,15 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Sessões e config.json (no Windows, perfil Roaming).
 fn root(app: &AppHandle) -> Result<PathBuf, String> {
     app.path().data_dir().map(|d| d.join("gow-meet")).map_err(|e| e.to_string())
+}
+
+/// Modelos (~700 MB) e logs: pasta local da máquina (no Windows, AppData\Local, fora do
+/// perfil Roaming). No macOS é a mesma Application Support de `root`.
+fn local_root(app: &AppHandle) -> Result<PathBuf, String> {
+    app.path().local_data_dir().map(|d| d.join("gow-meet")).map_err(|e| e.to_string())
 }
 
 /// Limita os eventos de progresso a ~4 por segundo; sempre emite o primeiro,
@@ -112,11 +119,11 @@ impl Throttle {
 
 fn ensure_one(app: &AppHandle, cfg: &Config, id: &str) -> Result<PathBuf, String> {
     let spec = models::manifest().remove(id).ok_or(format!("modelo {id} fora do manifesto"))?;
-    let dir = root(app)?.join("models").join(id);
+    let dir = local_root(app)?.join("models").join(id);
     let app2 = app.clone();
-        let mut throttles: std::collections::HashMap<String, Throttle> = Default::default();
+    let mut throttles: std::collections::HashMap<String, Throttle> = Default::default();
     let base = std::env::var("GOW_MEET_MODELS_URL").unwrap_or_else(|_| cfg.models_base_url.clone());
-    models::ensure(&spec, &base, &dir, &HttpFetch, &mut |file, done, total| {
+    models::ensure(&spec, &base, &dir, &HttpFetch::default(), &mut |file, done, total| {
         let th = throttles.entry(file.to_string()).or_insert_with(Throttle::new);
         if th.allow(Instant::now(), done, total) {
             let _ = app2.emit("models-progress", serde_json::json!({"file": file, "done": done, "total": total}));
@@ -207,6 +214,8 @@ fn build_session(app: &AppHandle, st: &AppState, title: Option<String>) -> Resul
     let pipeline = Arc::new(Pipeline::start(PipelineConfig::default(), Box::new(asr), Box::new(tr),
                                             writer, Arc::new(TauriSink(app.clone()))));
     let (tx, rx) = crossbeam_channel::unbounded();
+    // Início da linha do tempo das fontes: antes de abri-las.
+    let t0 = Instant::now();
     let mut sys = SystemSource::new();
     if let Err(e) = sys.start(tx.clone()) {
         tracing::warn!("áudio do sistema indisponível: {e:#}");
@@ -222,9 +231,13 @@ fn build_session(app: &AppHandle, st: &AppState, title: Option<String>) -> Resul
     let pump = {
         let (stop, pipeline, app) = (stop.clone(), pipeline.clone(), app.clone());
         std::thread::Builder::new().name("pump".into()).spawn(move || {
+            // Lacunas de entrega (reconexão, ScreenCaptureKit calado) viram silêncio, para o
+            // t0 de cada fonte acompanhar o relógio e a ordem das falas na janela flutuante.
+            let mut clock = SourceClock::default();
             while !stop.load(Ordering::SeqCst) {
                 match rx.recv_timeout(Duration::from_millis(200)) {
-                    Ok(CaptureEvent::Audio { source, samples }) => pipeline.feed(source, &samples),
+                    Ok(CaptureEvent::Audio { source, samples }) =>
+                        clock.align(source, t0.elapsed(), &samples, |x| pipeline.feed(source, x)),
                     Ok(CaptureEvent::Reconnecting(source)) => {
                         tracing::warn!(?source, "reconectando fonte de áudio");
                         let _ = app.emit("gow-meet", UiEvent::Reconnecting { source });
@@ -248,12 +261,41 @@ async fn stop_session(app: AppHandle) -> Result<String, String> {
 }
 
 fn stop_blocking(app: &AppHandle) -> Result<String, String> {
-    let st = app.state::<AppState>();
+    let result = end_session(&app.state::<AppState>());
+    if let Some(w) = app.get_webview_window("overlay") { let _ = w.hide(); }
+    match result {
+        Ok(md) => {
+            let _ = app.emit("gow-meet", UiEvent::Stopped { transcript: md.clone() });
+            tracing::info!("sessão encerrada");
+            Ok(md)
+        }
+        Err(e) => {
+            if !matches!(e, EndError::NotRunning) { tracing::error!("falha ao encerrar a sessão: {e}"); }
+            Err(e.to_string())
+        }
+    }
+}
+
+#[derive(Debug)]
+enum EndError { NotRunning, Failed(String) }
+
+impl std::fmt::Display for EndError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EndError::NotRunning => f.write_str("nenhuma reunião em andamento"),
+            EndError::Failed(e) => f.write_str(e),
+        }
+    }
+}
+
+/// Encerra a sessão em andamento sem tocar em janelas nem emitir eventos: serve também
+/// ao `RunEvent::Exit`, quando o laço de eventos já está sendo desmontado. Idempotente.
+fn end_session(st: &AppState) -> Result<String, EndError> {
     let mut run = {
         let mut slot = lock(&st.slot);
         match std::mem::replace(&mut *slot, Slot::Stopping) {
             Slot::Running(r) => r,
-            other => { *slot = other; return Err("nenhuma reunião em andamento".to_string()); }
+            other => { *slot = other; return Err(EndError::NotRunning); }
         }
     };
     // Ordem: parar a captura, encerrar o pump, finalizar o pipeline.
@@ -266,18 +308,24 @@ fn stop_blocking(app: &AppHandle) -> Result<String, String> {
         .map_err(|_| "pipeline ainda em uso".to_string())
         .and_then(|p| p.finish(ended).map_err(|e| format!("{e:#}")));
     *lock(&st.slot) = Slot::Idle;
-    if let Some(w) = app.get_webview_window("overlay") { let _ = w.hide(); }
-    match result {
-        Ok(md) => {
-            let transcript = md.display().to_string();
-            let _ = app.emit("gow-meet", UiEvent::Stopped { transcript: transcript.clone() });
-            tracing::info!("sessão encerrada");
-            Ok(transcript)
-        }
-        Err(e) => {
-            tracing::error!("falha ao encerrar a sessão: {e}");
-            Err(e)
-        }
+    result.map(|md| md.display().to_string()).map_err(EndError::Failed)
+}
+
+/// Cmd+Q / Dock → Encerrar: o macOS chama `applicationWillTerminate`, que vira
+/// `RunEvent::Exit` de forma síncrona, antes de o processo sair. Fecha a sessão aqui.
+fn shutdown_on_exit(app: &AppHandle) {
+    let st = app.state::<AppState>();
+    // Um encerramento em outra thread (botão ou fechar janela) termina antes; limite de 30 s.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while matches!(*lock(&st.slot), Slot::Stopping) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // Uma partida ainda em andamento (`Starting`) não é esperada: a recuperação na
+    // próxima abertura fecha a sessão incompleta.
+    match end_session(&st) {
+        Ok(_) => tracing::info!("sessão encerrada ao sair do app"),
+        Err(EndError::NotRunning) => {}
+        Err(e) => tracing::error!("falha ao encerrar a sessão ao sair: {e}"),
     }
 }
 
@@ -324,7 +372,9 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             let root = root(app.handle())?;
-            if let Some(guard) = init_logs(&root) { app.manage(guard); }
+            let local = local_root(app.handle())?;
+            if let Some(guard) = init_logs(&local) { app.manage(guard); }
+            tracing::info!(dados = %root.display(), locais = %local.display(), "pastas do app");
             let config = Config::load(&root.join("config.json"));
             app.manage(AppState { config, slot: Mutex::new(Slot::Idle), models: Mutex::new(None) });
             let now = chrono::Local::now().timestamp_millis() as u64;
@@ -336,16 +386,27 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            if window.label() == "main" {
-                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                    api.prevent_close();
-                    shutdown_on_close(window.app_handle().clone());
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                match window.label() {
+                    "main" => {
+                        api.prevent_close();
+                        shutdown_on_close(window.app_handle().clone());
+                    }
+                    // Cmd+W na flutuante só a esconde: ela volta na próxima sessão.
+                    "overlay" => {
+                        api.prevent_close();
+                        let _ = window.hide();
+                    }
+                    _ => {}
                 }
             }
         })
         .invoke_handler(tauri::generate_handler![ensure_models, start_session, stop_session, list_sessions])
-        .run(tauri::generate_context!())
-        .expect("erro ao iniciar o gow-meet");
+        .build(tauri::generate_context!())
+        .expect("erro ao iniciar o gow-meet")
+        .run(|app, event| {
+            if let RunEvent::Exit = event { shutdown_on_exit(app); }
+        });
 }
 
 #[cfg(test)]
@@ -367,6 +428,19 @@ mod tests {
         assert_eq!(v, serde_json::json!({"kind": "dropped", "id": "s3"}));
         let v = serde_json::to_value(UiEvent::Reconnecting { source: SpeakerSource::Mic }).unwrap();
         assert_eq!(v["kind"], "reconnecting");
+    }
+
+    /// O `PathResolver` do Tauri usa `dirs::data_dir` (root) e `dirs::data_local_dir`
+    /// (local_root). No macOS os dois são Application Support: os modelos já baixados
+    /// continuam em `.../gow-meet/models`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_models_and_logs_stay_in_application_support() {
+        let data = dirs::data_dir().unwrap();
+        let local = dirs::data_local_dir().unwrap();
+        eprintln!("data_dir = {}\ndata_local_dir = {}", data.display(), local.display());
+        assert_eq!(data, local);
+        assert!(local.ends_with("Library/Application Support"));
     }
 
     #[test]
