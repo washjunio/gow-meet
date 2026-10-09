@@ -1,0 +1,49 @@
+{
+  "whisper-small-en": {
+    "files": [
+      {
+        "name": "ggml-small.en-q5_1.bin",
+        "path": "ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-small.en-q5_1.bin",
+        "sha256": "bfdff4894dcb76bbf647d56263ea2a96645423f1669176f4844a1bf8e478ad30"
+      }
+    ]
+  },
+  "whisper-turbo": {
+    "files": [
+      {
+        "name": "ggml-large-v3-turbo-q5_0.bin",
+        "path": "ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-large-v3-turbo-q5_0.bin",
+        "sha256": "394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2"
+      }
+    ]
+  },
+  "opus-mt-en-pt": {
+    "files": [
+      {
+        "name": "model.bin",
+        "path": "gow-solucoes/opus-mt-en-pt-ct2/resolve/b66dc8aa47cd5f6664433c0638e9b724ec563bf3/model.bin",
+        "sha256": "5c2b607d9f0c00e935a00a497aa4c523225288697fbca57ddb7f9ee96fe80006"
+      },
+      {
+        "name": "config.json",
+        "path": "gow-solucoes/opus-mt-en-pt-ct2/resolve/b66dc8aa47cd5f6664433c0638e9b724ec563bf3/config.json",
+        "sha256": "8f6496adfc930cbfecbe8281112197705c488fab47d34b4829b06d7f478909af"
+      },
+      {
+        "name": "shared_vocabulary.json",
+        "path": "gow-solucoes/opus-mt-en-pt-ct2/resolve/b66dc8aa47cd5f6664433c0638e9b724ec563bf3/shared_vocabulary.json",
+        "sha256": "9dcef92228c074bd608459f25472da586e2d15ca1ff1af0956d17573d35b9d1b"
+      },
+      {
+        "name": "source.spm",
+        "path": "gow-solucoes/opus-mt-en-pt-ct2/resolve/b66dc8aa47cd5f6664433c0638e9b724ec563bf3/source.spm",
+        "sha256": "7a7fcf812cf03a5785daa35d4932bbbe69e7e605c0fe56fce5a3f731d6c355aa"
+      },
+      {
+        "name": "target.spm",
+        "path": "gow-solucoes/opus-mt-en-pt-ct2/resolve/b66dc8aa47cd5f6664433c0638e9b724ec563bf3/target.spm",
+        "sha256": "b3cf20ccd4e48a89882cfdba157c05fa1cd71a6b69517dfc80e3a34d387ea91f"
+      }
+    ]
+  }
+}
