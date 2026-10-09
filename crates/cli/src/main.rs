@@ -47,8 +47,7 @@ impl Sink for Term {
             PipelineEvent::Translated(l) => {
                 // "Fala fechada" = fim da fala, não fim do buffer: o t1 final já inclui
                 // os `silence_close_ms` de silêncio que fecharam o segmento.
-                let speech_end = l.t1.saturating_sub(self.silence_close_ms);
-                self.finals.lock().unwrap().push(now.saturating_sub(speech_end));
+                self.finals.lock().unwrap().push(speech_end_latency(now, l.t1, self.silence_close_ms));
                 println!("    → {}", l.translation.as_deref().unwrap_or("(sem tradução)"));
             }
             PipelineEvent::Lag { ms } => eprintln!("! atraso de {ms} ms"),
@@ -57,6 +56,11 @@ impl Sink for Term {
             PipelineEvent::Dropped { .. } => {}
         }
     }
+}
+
+/// Latência desde o fim da fala: o t1 final inclui `silence_ms` de silêncio de fechamento.
+fn speech_end_latency(now_ms: u64, t1_ms: u64, silence_ms: u64) -> u64 {
+    now_ms.saturating_sub(t1_ms.saturating_sub(silence_ms))
 }
 
 fn percentile(v: &[u64], p: f64) -> u64 {
@@ -70,7 +74,14 @@ fn percentile(v: &[u64], p: f64) -> u64 {
 fn main() -> Result<()> {
     let a = Args::parse();
     let one = read_wav_16k_mono(&a.wav)?;
-    let audio: Vec<f32> = std::iter::repeat(one).take(a.repeat).flatten().collect();
+    let cfg = PipelineConfig::default();
+    // Silêncio entre cópias: fecha a última fala de cada cópia (silence_close_ms + 1 s de margem).
+    let gap = vec![0.0f32; ((cfg.segmenter.silence_close_ms + 1_000) * 16) as usize];
+    let mut audio: Vec<f32> = Vec::new();
+    for i in 0..a.repeat {
+        if i > 0 { audio.extend_from_slice(&gap); }
+        audio.extend_from_slice(&one);
+    }
     let asr = WhisperTranscriber::new(&a.whisper, "en", !a.cpu)?;
     let tr = Ct2Translator::new(&a.opus, a.prefix.clone())?;
     let now = chrono::Local::now();
@@ -79,7 +90,6 @@ fn main() -> Result<()> {
         app_version: gow_meet_core::version().into() };
     let started = meta.started;
     let writer = SessionWriter::create(&a.out, meta)?;
-    let cfg = PipelineConfig::default();
     let sink = Arc::new(Term { start: Instant::now(), silence_close_ms: cfg.segmenter.silence_close_ms,
         finals: Mutex::new(vec![]), partials: Mutex::new(vec![]) });
     let p = Pipeline::start(cfg, Box::new(asr), Box::new(tr), writer, sink.clone());
@@ -107,6 +117,13 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn latency_from_speech_end() {
+        assert_eq!(super::speech_end_latency(5_000, 3_000, 600), 2_600);
+        assert_eq!(super::speech_end_latency(500, 300, 600), 500); // t1 < silêncio
+        assert_eq!(super::speech_end_latency(100, 3_000, 600), 0);
+    }
+
     #[test]
     fn percentile_nearest_rank() {
         let v = vec![100, 200, 300, 400, 500, 600, 700, 800, 900, 1000];
