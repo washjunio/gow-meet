@@ -151,8 +151,8 @@ pub fn render_markdown(meta: &Meta, lines: &[Line]) -> String {
 }
 
 /// Encerra sessões sem `ended` (app fechou no meio). `ended` = início + último t1,
-/// ou `now_ms` se não houver falas.
-pub fn recover_unfinished(root: &Path, _now_ms: u64) -> Result<Vec<PathBuf>> {
+/// ou o próprio início se não houver falas.
+pub fn recover_unfinished(root: &Path) -> Result<Vec<PathBuf>> {
     let mut done = vec![];
     let Ok(entries) = fs::read_dir(root) else { return Ok(done) };
     for entry in entries.flatten() {
@@ -253,12 +253,12 @@ mod tests {
         let mut w = SessionWriter::create(root.path(), meta("s5")).unwrap();
         w.append(&line("f1", 2_000, "Hello team.", None)).unwrap();
         drop(w); // simula queda: sem finish
-        let done = recover_unfinished(root.path(), 99_000).unwrap();
+        let done = recover_unfinished(root.path()).unwrap();
         assert_eq!(done.len(), 1);
         let m: Meta = serde_json::from_slice(&std::fs::read(root.path().join("s5/meta.json")).unwrap()).unwrap();
         assert_eq!(m.ended, Some(1_000 + 2_500)); // started + último t1
         assert!(root.path().join("s5/transcript.md").exists());
-        assert!(recover_unfinished(root.path(), 99_000).unwrap().is_empty());
+        assert!(recover_unfinished(root.path()).unwrap().is_empty());
     }
 
     #[test]
@@ -266,7 +266,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let w = SessionWriter::create(root.path(), meta("vazia")).unwrap();
         drop(w); // queda antes de qualquer fala
-        let done = recover_unfinished(root.path(), 99_000).unwrap();
+        let done = recover_unfinished(root.path()).unwrap();
         assert_eq!(done.len(), 1);
         let m: Meta = serde_json::from_slice(&std::fs::read(root.path().join("vazia/meta.json")).unwrap()).unwrap();
         assert_eq!(m.ended, Some(m.started));
@@ -286,7 +286,7 @@ mod tests {
         let got = replay(&path).unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].id, "f1");
-        let done = recover_unfinished(root.path(), 99_000).unwrap();
+        let done = recover_unfinished(root.path()).unwrap();
         assert_eq!(done.len(), 1);
     }
 
@@ -302,7 +302,7 @@ mod tests {
         let bad_dir = root.path().join("bad");
         std::fs::remove_file(bad_dir.join("lines.jsonl")).unwrap();
         std::fs::create_dir(bad_dir.join("lines.jsonl")).unwrap();
-        let done = recover_unfinished(root.path(), 99_000).unwrap();
+        let done = recover_unfinished(root.path()).unwrap();
         assert_eq!(done, vec![root.path().join("good")]);
         assert!(root.path().join("good/transcript.md").exists());
     }

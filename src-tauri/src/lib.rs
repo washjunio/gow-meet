@@ -384,8 +384,7 @@ pub fn run() {
             tracing::info!(dados = %root.display(), locais = %local.display(), "pastas do app");
             let config = Config::load(&root.join("config.json"));
             app.manage(AppState { config, slot: Mutex::new(Slot::Idle), models: Mutex::new(None) });
-            let now = chrono::Local::now().timestamp_millis() as u64;
-            match recover_unfinished(&root.join("sessions"), now) {
+            match recover_unfinished(&root.join("sessions")) {
                 Ok(done) if !done.is_empty() => tracing::info!("{} sessão(ões) recuperada(s)", done.len()),
                 Ok(_) => {}
                 Err(e) => tracing::error!("recuperação: {e:#}"),
