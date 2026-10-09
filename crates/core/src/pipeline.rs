@@ -90,10 +90,14 @@ impl Store {
     }
 }
 
+/// Parciais ainda abertas: id -> t1 da parcial mais recente exibida. Ausente
+/// significa fechada (final/descartada) ou nunca exibida. Quem emite eventos de
+/// um id o faz com este lock, o que garante a ordem por id.
+type OpenPartials = Arc<Mutex<HashMap<String, u64>>>;
+
 enum TJob {
     Final(Line),
     Partial { id: String, speaker: Speaker, t0: u64, t1: u64, text: String },
-    Dropped { id: String },
 }
 
 pub struct Pipeline {
@@ -115,15 +119,17 @@ impl Pipeline {
         let (tr_tx, tr_rx) = unbounded::<TJob>();
         let store = Arc::new(Mutex::new(Some(Store { writer, pending: vec![] })));
         let fed = Arc::new(Mutex::new(HashMap::new()));
+        let open: OpenPartials = Arc::new(Mutex::new(HashMap::new()));
         let asr_h = {
-            let (store, sink, fed, warn) = (store.clone(), sink.clone(), fed.clone(), cfg.lag_warn_ms);
+            let (store, sink, fed, warn, open) =
+                (store.clone(), sink.clone(), fed.clone(), cfg.lag_warn_ms, open.clone());
             std::thread::Builder::new().name("asr".into())
-                .spawn(move || asr_loop(asr_rx, asr, tr_tx, store, sink, fed, warn)).expect("thread asr")
+                .spawn(move || asr_loop(asr_rx, asr, tr_tx, store, sink, fed, warn, open)).expect("thread asr")
         };
         let tr_h = {
             let (store, every) = (store.clone(), Duration::from_millis(cfg.partial_translate_every_ms));
             std::thread::Builder::new().name("translate".into())
-                .spawn(move || translate_loop(tr_rx, translator, store, sink, every)).expect("thread translate")
+                .spawn(move || translate_loop(tr_rx, translator, store, sink, every, open)).expect("thread translate")
         };
         Self { cfg, segmenters: Mutex::new(HashMap::new()), fed, asr_tx: Some(asr_tx),
                asr: Some(asr_h), tr: Some(tr_h), store }
@@ -172,9 +178,8 @@ impl Pipeline {
 fn asr_loop(
     rx: Receiver<AsrJob>, mut asr: Box<dyn Transcriber>, tr_tx: Sender<TJob>,
     store: Arc<Mutex<Option<Store>>>, sink: Arc<dyn Sink>,
-    fed: Arc<Mutex<HashMap<SpeakerSource, u64>>>, lag_warn_ms: u64,
+    fed: Arc<Mutex<HashMap<SpeakerSource, u64>>>, lag_warn_ms: u64, open: OpenPartials,
 ) {
-    let mut shown: HashSet<String> = HashSet::new();
     while let Ok(first) = rx.recv() {
         let mut batch = vec![first];
         batch.extend(rx.try_iter());
@@ -182,31 +187,45 @@ fn asr_loop(
             let fed_ms = fed.lock().unwrap().get(&job.source).copied().unwrap_or(0) / 16;
             let lag = fed_ms.saturating_sub(job.end_ms);
             if lag > lag_warn_ms { sink.emit(PipelineEvent::Lag { ms: lag }); }
+            let id = line_id(job.source, job.seq);
+            // Fala final sem texto aproveitável: remove a parcial já exibida, se houver.
+            let drop_final = |sink: &dyn Sink| {
+                if job.is_final {
+                    let mut o = open.lock().unwrap();
+                    if o.remove(&id).is_some() { sink.emit(PipelineEvent::Dropped { id: id.clone() }); }
+                }
+            };
             let raw = match asr.transcribe(&job.audio) {
                 Ok(t) => t,
                 Err(e) => {
                     tracing::warn!(source = ?job.source, seq = job.seq, "falha na transcrição: {e}");
                     sink.emit(PipelineEvent::Error(format!("falha na transcrição: {e}")));
+                    drop_final(sink.as_ref());
                     continue;
                 }
             };
-            let id = line_id(job.source, job.seq);
             let Some(text) = clean_transcript(&raw) else {
-                if job.is_final && shown.remove(&id) { let _ = tr_tx.send(TJob::Dropped { id }); }
+                drop_final(sink.as_ref());
                 continue;
             };
             let speaker = speaker_for(job.source);
             if job.is_final {
-                shown.remove(&id);
                 let line = Line { id, t0: job.start_ms, t1: job.end_ms, speaker, text,
                                   translation: None, translation_error: false };
                 if let Some(s) = store.lock().unwrap().as_mut() { s.append(&line, sink.as_ref()); }
-                sink.emit(PipelineEvent::Final(line.clone()));
+                {
+                    let mut o = open.lock().unwrap();
+                    o.remove(&line.id);
+                    sink.emit(PipelineEvent::Final(line.clone()));
+                }
                 let _ = tr_tx.send(TJob::Final(line));
             } else {
-                shown.insert(id.clone());
-                sink.emit(PipelineEvent::Partial { id: id.clone(), speaker: speaker.clone(),
-                    t0: job.start_ms, t1: job.end_ms, text: text.clone(), translation: None });
+                {
+                    let mut o = open.lock().unwrap();
+                    o.insert(id.clone(), job.end_ms);
+                    sink.emit(PipelineEvent::Partial { id: id.clone(), speaker: speaker.clone(),
+                        t0: job.start_ms, t1: job.end_ms, text: text.clone(), translation: None });
+                }
                 let _ = tr_tx.send(TJob::Partial { id, speaker, t0: job.start_ms, t1: job.end_ms, text });
             }
         }
@@ -215,19 +234,14 @@ fn asr_loop(
 
 fn translate_loop(
     rx: Receiver<TJob>, mut tr: Box<dyn Translator>, store: Arc<Mutex<Option<Store>>>,
-    sink: Arc<dyn Sink>, every: Duration,
+    sink: Arc<dyn Sink>, every: Duration, open: OpenPartials,
 ) {
     let mut last_partial: HashMap<SpeakerSource, Instant> = HashMap::new();
     while let Ok(first) = rx.recv() {
         let mut batch = vec![first];
         batch.extend(rx.try_iter());
         let final_ids: HashSet<String> = batch.iter()
-            .filter_map(|j| match j {
-                TJob::Final(l) => Some(l.id.clone()),
-                TJob::Dropped { id } => Some(id.clone()),
-                _ => None,
-            }).collect();
-        let mut dropped: Vec<String> = Vec::new();
+            .filter_map(|j| match j { TJob::Final(l) => Some(l.id.clone()), _ => None }).collect();
         let mut partials: HashMap<SpeakerSource, TJob> = HashMap::new();
         for job in batch {
             match job {
@@ -246,7 +260,6 @@ fn translate_loop(
                     partials.insert(speaker.source, job);
                 }
                 TJob::Partial { .. } => {}
-                TJob::Dropped { id } => dropped.push(id),
             }
         }
         for (src, job) in partials {
@@ -254,11 +267,13 @@ fn translate_loop(
             let TJob::Partial { id, speaker, t0, t1, text } = job else { continue };
             if let Ok(t) = tr.translate(&text) {
                 last_partial.insert(src, Instant::now());
-                sink.emit(PipelineEvent::Partial { id, speaker, t0, t1, text, translation: Some(t) });
+                // Só emite se a parcial ainda é a mais recente e a fala segue aberta.
+                let o = open.lock().unwrap();
+                if o.get(&id).is_some_and(|&latest| t1 >= latest) {
+                    sink.emit(PipelineEvent::Partial { id, speaker, t0, t1, text, translation: Some(t) });
+                }
             }
         }
-        // Depois das parciais traduzidas, para a remoção ser sempre o último evento do id.
-        for id in dropped { sink.emit(PipelineEvent::Dropped { id }); }
     }
 }
 
@@ -398,10 +413,13 @@ mod tests {
         assert_eq!(lines.len(), 1);
     }
 
-    struct Switch(Arc<std::sync::atomic::AtomicBool>);
+    /// Antes do gatilho devolve texto; depois, marcador (ou erro, se `fail`).
+    struct Switch { flag: Arc<std::sync::atomic::AtomicBool>, fail: bool }
     impl Transcriber for Switch {
         fn transcribe(&mut self, _a: &[f32]) -> Result<String> {
-            Ok(if self.0.load(std::sync::atomic::Ordering::SeqCst) { "[BLANK_AUDIO]" } else { "Hello team." }.into())
+            if !self.flag.load(std::sync::atomic::Ordering::SeqCst) { return Ok("Hello team.".into()); }
+            if self.fail { anyhow::bail!("falhou") }
+            Ok("[BLANK_AUDIO]".into())
         }
     }
 
@@ -409,7 +427,7 @@ mod tests {
     fn discarded_final_after_partial_emits_dropped() {
         let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let f2 = flag.clone();
-        let (_d, ev, lines) = run_partial_then_close(Box::new(Switch(flag)), "s0",
+        let (_d, ev, lines) = run_partial_then_close(Box::new(Switch { flag, fail: false }), "s0",
             move || f2.store(true, std::sync::atomic::Ordering::SeqCst));
         assert!(lines.is_empty());
         assert!(!ev.iter().any(|e| matches!(e, PipelineEvent::Final(_))));
@@ -417,6 +435,97 @@ mod tests {
         let d = ev.iter().position(|e| matches!(e, PipelineEvent::Dropped { id } if id == "s0")).unwrap();
         assert!(p < d);
         assert_eq!(ev.iter().filter(|e| matches!(e, PipelineEvent::Dropped { .. })).count(), 1);
+    }
+
+    #[test]
+    fn failed_final_after_partial_emits_dropped() {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let f2 = flag.clone();
+        let (_d, ev, lines) = run_partial_then_close(Box::new(Switch { flag, fail: true }), "s0",
+            move || f2.store(true, std::sync::atomic::Ordering::SeqCst));
+        assert!(lines.is_empty());
+        assert!(ev.iter().any(|e| matches!(e, PipelineEvent::Error(_))));
+        let p = ev.iter().position(|e| matches!(e, PipelineEvent::Partial { id, .. } if id == "s0")).unwrap();
+        let d = ev.iter().position(|e| matches!(e, PipelineEvent::Dropped { id } if id == "s0")).unwrap();
+        assert!(p < d);
+    }
+
+    /// Tradutor que bloqueia na primeira chamada até ser liberado pelo teste.
+    struct Gate { entered: crossbeam_channel::Sender<()>, release: Receiver<()>, first: bool }
+    impl Translator for Gate {
+        fn translate(&mut self, t: &str) -> Result<String> {
+            if std::mem::take(&mut self.first) {
+                let _ = self.entered.send(());
+                let _ = self.release.recv_timeout(Duration::from_secs(10));
+            }
+            Ok(format!("pt: {t}"))
+        }
+    }
+
+    fn gated() -> (tempfile::TempDir, Pipeline, Arc<ChanSink>, Receiver<PipelineEvent>,
+                   Receiver<()>, Sender<()>) {
+        let root = tempfile::tempdir().unwrap();
+        let meta = Meta { v: 1, id: "t".into(), title: "Teste".into(), started: 0, ended: None,
+            source_lang: "en".into(), target_lang: "pt".into(), models: Default::default(),
+            app_version: "0".into() };
+        let writer = SessionWriter::create(root.path(), meta).unwrap();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let sink = Arc::new(ChanSink(Mutex::new(vec![]), tx));
+        let (etx, erx) = crossbeam_channel::unbounded();
+        let (rtx, rrx) = crossbeam_channel::unbounded();
+        let tr = Gate { entered: etx, release: rrx, first: true };
+        let p = Pipeline::start(PipelineConfig::default(), Box::new(FakeAsr("Hello team.")),
+            Box::new(tr), writer, sink.clone());
+        (root, p, sink, rx, erx, rtx)
+    }
+
+    /// Espera (com limite) um evento que satisfaça `pred`.
+    fn wait_for(rx: &Receiver<PipelineEvent>, pred: impl Fn(&PipelineEvent) -> bool) -> PipelineEvent {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(e) if pred(&e) => return e,
+                Ok(_) => {}
+                Err(_) => panic!("evento esperado não chegou a tempo"),
+            }
+        }
+    }
+
+    #[test]
+    fn translated_partial_never_follows_final() {
+        let (_d, p, sink, rx, entered, release) = gated();
+        for c in tone(1_500).chunks(480) { p.feed(SpeakerSource::System, c); }
+        // A tradução da parcial está em andamento (bloqueada) antes de a fala fechar.
+        entered.recv_timeout(Duration::from_secs(10)).unwrap();
+        p.feed(SpeakerSource::System, &silence(1_000));
+        wait_for(&rx, |e| matches!(e, PipelineEvent::Final(l) if l.id == "s0"));
+        release.send(()).unwrap();
+        p.finish(10_000).unwrap();
+        let ev = sink.0.lock().unwrap().clone();
+        let fin = ev.iter().position(|e| matches!(e, PipelineEvent::Final(_))).unwrap();
+        assert!(!ev[fin..].iter().any(|e| matches!(e, PipelineEvent::Partial { .. })));
+        assert!(ev.iter().any(|e| matches!(e, PipelineEvent::Translated(l) if l.id == "s0")));
+    }
+
+    #[test]
+    fn older_partial_translation_is_not_emitted_after_newer_partial() {
+        let (_d, p, sink, rx, entered, release) = gated();
+        for c in tone(1_500).chunks(480) { p.feed(SpeakerSource::System, c); }
+        let v1 = match wait_for(&rx, |e| matches!(e, PipelineEvent::Partial { .. })) {
+            PipelineEvent::Partial { t1, .. } => t1,
+            _ => unreachable!(),
+        };
+        entered.recv_timeout(Duration::from_secs(10)).unwrap();
+        // Parcial mais nova (v2) exibida enquanto a tradução da v1 está bloqueada.
+        for c in tone(2_000).chunks(480) { p.feed(SpeakerSource::System, c); }
+        wait_for(&rx, |e| matches!(e, PipelineEvent::Partial { t1, .. } if *t1 > v1));
+        release.send(()).unwrap();
+        p.feed(SpeakerSource::System, &silence(1_000));
+        p.finish(10_000).unwrap();
+        let ev = sink.0.lock().unwrap().clone();
+        let t1s: Vec<u64> = ev.iter().filter_map(|e| match e {
+            PipelineEvent::Partial { id, t1, .. } if id == "s0" => Some(*t1), _ => None }).collect();
+        assert!(t1s.windows(2).all(|w| w[0] <= w[1]), "t1 regrediu: {t1s:?}");
     }
 
     fn job(source: SpeakerSource, seq: u64, is_final: bool, end_ms: u64) -> AsrJob {
