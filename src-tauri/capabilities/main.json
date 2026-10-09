@@ -1,12 +1,14 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
-  "identifier": "default",
-  "description": "permissões das janelas main e overlay",
-  "windows": ["main", "overlay"],
+  "identifier": "main",
+  "description": "janela principal: comandos, eventos e abertura da transcrição e dos Ajustes do Sistema",
+  "windows": ["main"],
   "permissions": [
     "core:default",
-    "core:window:allow-start-dragging",
-    "opener:default",
+    "allow-ensure-models",
+    "allow-start-session",
+    "allow-stop-session",
+    "allow-list-sessions",
     { "identifier": "opener:allow-open-url", "allow": [{ "url": "x-apple.systempreferences:*" }] },
     { "identifier": "opener:allow-open-path", "allow": [{ "path": "$DATA/gow-meet/**" }] }
   ]
