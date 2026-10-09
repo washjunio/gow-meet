@@ -1,0 +1,5 @@
+# ct2rs (CTranslate2/sentencepiece) força o CRT estático (/MT) no Windows MSVC.
+# Com crt-static, whisper-rs-sys (crate cmake/cc) também compila com /MT,
+# evitando LNK2038 (MT_StaticRelease vs MD_DynamicRelease).
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
