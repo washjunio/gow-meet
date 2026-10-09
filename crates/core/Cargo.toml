@@ -25,9 +25,11 @@ tempfile = "3"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 whisper-rs = { version = "0.14", features = ["metal"] }
+ct2rs = { version = "0.9", features = ["accelerate"] }
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 whisper-rs = { version = "0.14" }
+ct2rs = { version = "0.9" }
 
 [features]
 vulkan = ["whisper-rs/vulkan"]

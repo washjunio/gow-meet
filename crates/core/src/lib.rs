@@ -3,6 +3,7 @@ pub mod models;
 pub mod resample;
 pub mod segmenter;
 pub mod session;
+pub mod translate;
 pub mod wav;
 pub mod wer;
 
