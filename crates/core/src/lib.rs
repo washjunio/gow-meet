@@ -1,3 +1,5 @@
+pub mod resample;
+pub mod segmenter;
 pub mod session;
 
 pub fn version() -> &'static str {
