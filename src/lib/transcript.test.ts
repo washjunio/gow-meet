@@ -96,6 +96,10 @@ describe("applyEvent", () => {
     expect(permissionKind("sem permissão de Gravação de Tela e Áudio do Sistema (x)")).toBe("screen");
     expect(permissionKind("Sem permissão para o Microfone")).toBe("mic");
     expect(permissionKind("nenhum microfone")).toBeNull();
+    // aviso do backend quando o microfone só entrega zeros exatos (acesso negado)
+    expect(permissionKind(
+      "O microfone só entrega silêncio absoluto: verifique a permissão de Microfone do gow-meet.",
+    )).toBe("mic");
     expect(permissionKind("GPU indisponível")).toBeNull();
   });
 });

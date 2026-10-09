@@ -84,6 +84,10 @@ export function MainWindow() {
           {phase === "stopping" ? "Encerrando…" : "Encerrar"}
         </button>
       </div>
+      <p className="hint-main">
+        Use fones de ouvido: no alto-falante, a fala do participante também entra pelo microfone e
+        aparece duplicada como &apos;Você&apos;.
+      </p>
       {phase === "starting" && files.length > 0 && (
         <ul className="progress">
           {files.map((p) => (
