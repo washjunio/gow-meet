@@ -114,12 +114,11 @@ fn ensure_one(app: &AppHandle, cfg: &Config, id: &str) -> Result<PathBuf, String
     let spec = models::manifest().remove(id).ok_or(format!("modelo {id} fora do manifesto"))?;
     let dir = root(app)?.join("models").join(id);
     let app2 = app.clone();
-    let file = id.to_string();
-    // A função de progresso do core não informa o arquivo; o identificador do modelo o substitui.
-    let mut throttle = Throttle::new();
+        let mut throttles: std::collections::HashMap<String, Throttle> = Default::default();
     let base = std::env::var("GOW_MEET_MODELS_URL").unwrap_or_else(|_| cfg.models_base_url.clone());
-    models::ensure(&spec, &base, &dir, &HttpFetch, &mut |done, total| {
-        if throttle.allow(Instant::now(), done, total) {
+    models::ensure(&spec, &base, &dir, &HttpFetch, &mut |file, done, total| {
+        let th = throttles.entry(file.to_string()).or_insert_with(Throttle::new);
+        if th.allow(Instant::now(), done, total) {
             let _ = app2.emit("models-progress", serde_json::json!({"file": file, "done": done, "total": total}));
         }
     }).map_err(|e| {
@@ -244,39 +243,58 @@ fn build_session(app: &AppHandle, st: &AppState, title: Option<String>) -> Resul
 
 #[tauri::command]
 async fn stop_session(app: AppHandle) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let st = app.state::<AppState>();
-        let mut run = {
-            let mut slot = lock(&st.slot);
-            match std::mem::replace(&mut *slot, Slot::Stopping) {
-                Slot::Running(r) => r,
-                other => { *slot = other; return Err("nenhuma reunião em andamento".to_string()); }
-            }
-        };
-        // Ordem: parar a captura, encerrar o pump, finalizar o pipeline.
-        run.mic.stop();
-        run.sys.stop();
-        run.stop.store(true, Ordering::SeqCst);
-        let _ = run.pump.join();
-        let ended = run.started_ms + run.started.elapsed().as_millis() as u64;
-        let result = Arc::try_unwrap(run.pipeline)
-            .map_err(|_| "pipeline ainda em uso".to_string())
-            .and_then(|p| p.finish(ended).map_err(|e| format!("{e:#}")));
-        *lock(&st.slot) = Slot::Idle;
-        if let Some(w) = app.get_webview_window("overlay") { let _ = w.hide(); }
-        match result {
-            Ok(md) => {
-                let transcript = md.display().to_string();
-                let _ = app.emit("gow-meet", UiEvent::Stopped { transcript: transcript.clone() });
-                tracing::info!("sessão encerrada");
-                Ok(transcript)
-            }
-            Err(e) => {
-                tracing::error!("falha ao encerrar a sessão: {e}");
-                Err(e)
-            }
+    tauri::async_runtime::spawn_blocking(move || stop_blocking(&app))
+        .await.map_err(|e| e.to_string())?
+}
+
+fn stop_blocking(app: &AppHandle) -> Result<String, String> {
+    let st = app.state::<AppState>();
+    let mut run = {
+        let mut slot = lock(&st.slot);
+        match std::mem::replace(&mut *slot, Slot::Stopping) {
+            Slot::Running(r) => r,
+            other => { *slot = other; return Err("nenhuma reunião em andamento".to_string()); }
         }
-    }).await.map_err(|e| e.to_string())?
+    };
+    // Ordem: parar a captura, encerrar o pump, finalizar o pipeline.
+    run.mic.stop();
+    run.sys.stop();
+    run.stop.store(true, Ordering::SeqCst);
+    let _ = run.pump.join();
+    let ended = run.started_ms + run.started.elapsed().as_millis() as u64;
+    let result = Arc::try_unwrap(run.pipeline)
+        .map_err(|_| "pipeline ainda em uso".to_string())
+        .and_then(|p| p.finish(ended).map_err(|e| format!("{e:#}")));
+    *lock(&st.slot) = Slot::Idle;
+    if let Some(w) = app.get_webview_window("overlay") { let _ = w.hide(); }
+    match result {
+        Ok(md) => {
+            let transcript = md.display().to_string();
+            let _ = app.emit("gow-meet", UiEvent::Stopped { transcript: transcript.clone() });
+            tracing::info!("sessão encerrada");
+            Ok(transcript)
+        }
+        Err(e) => {
+            tracing::error!("falha ao encerrar a sessão: {e}");
+            Err(e)
+        }
+    }
+}
+
+/// Fechar a janela principal encerra a sessão (se houver) e o app: nunca deixa a captura sem UI.
+fn shutdown_on_close(app: AppHandle) {
+    std::thread::spawn(move || {
+        let st = app.state::<AppState>();
+        // Uma partida em andamento termina antes de ser parada.
+        while matches!(*lock(&st.slot), Slot::Starting | Slot::Stopping) {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        if let Err(e) = stop_blocking(&app) {
+            tracing::debug!("encerramento sem sessão ativa: {e}");
+        }
+        if let Some(w) = app.get_webview_window("overlay") { let _ = w.hide(); }
+        app.exit(0);
+    });
 }
 
 #[tauri::command]
@@ -316,6 +334,14 @@ pub fn run() {
                 Err(e) => tracing::error!("recuperação: {e:#}"),
             }
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            if window.label() == "main" {
+                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                    shutdown_on_close(window.app_handle().clone());
+                }
+            }
         })
         .invoke_handler(tauri::generate_handler![ensure_models, start_session, stop_session, list_sessions])
         .run(tauri::generate_context!())

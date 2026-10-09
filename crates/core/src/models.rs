@@ -46,12 +46,17 @@ fn file_sha(path: &Path) -> Result<String> {
 
 pub fn ensure(
     spec: &ModelSpec, base_url: &str, dir: &Path, fetch: &dyn Fetch,
-    progress: &mut dyn FnMut(u64, Option<u64>),
+    progress: &mut dyn FnMut(&str, u64, Option<u64>),
 ) -> Result<PathBuf> {
     fs::create_dir_all(dir)?;
     for f in &spec.files {
         let dest = dir.join(&f.name);
-        if dest.exists() && file_sha(&dest)? == f.sha256 { continue; }
+        if dest.exists() && file_sha(&dest)? == f.sha256 {
+            // Arquivo já válido: um evento final para a interface mostrá-lo como completo.
+            let len = fs::metadata(&dest)?.len();
+            progress(&f.name, len, Some(len));
+            continue;
+        }
         let part = dir.join(format!("{}.part", f.name));
         let url = format!("{}/{}", base_url.trim_end_matches('/'), f.path);
         let (mut body, total) = fetch.open(&url)?;
@@ -65,7 +70,7 @@ pub fn ensure(
             out.write_all(&buf[..n])?;
             hasher.update(&buf[..n]);
             done += n as u64;
-            progress(done, total);
+            progress(&f.name, done, total);
         }
         out.sync_all()?;
         drop(out);
@@ -111,7 +116,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let f = fetch();
         let mut seen = 0;
-        ensure(&spec(sha(b"modelo")), "https://hf.test", dir.path(), &f, &mut |n, _| seen = n).unwrap();
+        ensure(&spec(sha(b"modelo")), "https://hf.test", dir.path(), &f, &mut |name, n, _| { assert_eq!(name, "m.bin"); seen = n }).unwrap();
         assert_eq!(std::fs::read(dir.path().join("m.bin")).unwrap(), b"modelo");
         assert_eq!(seen, 6);
     }
@@ -121,14 +126,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("m.bin"), b"modelo").unwrap();
         let f = fetch();
-        ensure(&spec(sha(b"modelo")), "https://hf.test", dir.path(), &f, &mut |_, _| {}).unwrap();
+        let mut ev = vec![];
+        ensure(&spec(sha(b"modelo")), "https://hf.test", dir.path(), &f,
+               &mut |name, d, t| ev.push((name.to_string(), d, t))).unwrap();
         assert_eq!(f.calls.get(), 0);
+        assert_eq!(ev, vec![("m.bin".to_string(), 6, Some(6))]);
     }
 
     #[test]
     fn wrong_hash_fails_and_leaves_nothing() {
         let dir = tempfile::tempdir().unwrap();
-        let err = ensure(&spec(sha(b"outro")), "https://hf.test", dir.path(), &fetch(), &mut |_, _| {});
+        let err = ensure(&spec(sha(b"outro")), "https://hf.test", dir.path(), &fetch(), &mut |_, _, _| {});
         assert!(err.is_err());
         assert!(std::fs::read_dir(dir.path()).unwrap().next().is_none());
     }
@@ -137,7 +145,7 @@ mod tests {
     fn corrupt_existing_file_is_replaced() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("m.bin"), b"corrompido").unwrap();
-        ensure(&spec(sha(b"modelo")), "https://hf.test", dir.path(), &fetch(), &mut |_, _| {}).unwrap();
+        ensure(&spec(sha(b"modelo")), "https://hf.test", dir.path(), &fetch(), &mut |_, _, _| {}).unwrap();
         assert_eq!(std::fs::read(dir.path().join("m.bin")).unwrap(), b"modelo");
     }
 
