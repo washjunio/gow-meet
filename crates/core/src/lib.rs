@@ -1,5 +1,6 @@
 pub mod asr;
 pub mod models;
+pub mod pipeline;
 pub mod resample;
 pub mod segmenter;
 pub mod session;
