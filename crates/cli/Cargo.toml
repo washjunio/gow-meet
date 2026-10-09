@@ -6,6 +6,8 @@ version.workspace = true
 [dependencies]
 gow-meet-core = { path = "../core" }
 anyhow.workspace = true
+crossbeam-channel.workspace = true
+ctrlc = "3"
 clap = { version = "4", features = ["derive"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 

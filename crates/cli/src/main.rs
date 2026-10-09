@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use gow_meet_core::asr::WhisperTranscriber;
 use gow_meet_core::pipeline::{Pipeline, PipelineConfig, PipelineEvent, Sink};
@@ -12,7 +12,10 @@ use std::time::{Duration, Instant};
 /// Roda o pipeline sobre um WAV, em ritmo real, e imprime latências.
 #[derive(Parser)]
 struct Args {
-    wav: PathBuf,
+    /// WAV de entrada (omita com --live).
+    wav: Option<PathBuf>,
+    /// Captura o sistema e o microfone ao vivo (Ctrl+C encerra).
+    #[arg(long)] live: bool,
     #[arg(long)] whisper: PathBuf,
     #[arg(long)] opus: PathBuf,
     /// Prefixo de idioma de destino do Opus-MT (ex.: '>>pob<<').
@@ -73,15 +76,8 @@ fn percentile(v: &[u64], p: f64) -> u64 {
 
 fn main() -> Result<()> {
     let a = Args::parse();
-    let one = read_wav_16k_mono(&a.wav)?;
     let cfg = PipelineConfig::default();
-    // Silêncio entre cópias: fecha a última fala de cada cópia (silence_close_ms + 1 s de margem).
-    let gap = vec![0.0f32; ((cfg.segmenter.silence_close_ms + 1_000) * 16) as usize];
-    let mut audio: Vec<f32> = Vec::new();
-    for i in 0..a.repeat {
-        if i > 0 { audio.extend_from_slice(&gap); }
-        audio.extend_from_slice(&one);
-    }
+    let silence_close_ms = cfg.segmenter.silence_close_ms;
     let asr = WhisperTranscriber::new(&a.whisper, "en", !a.cpu)?;
     let tr = Ct2Translator::new(&a.opus, a.prefix.clone())?;
     let now = chrono::Local::now();
@@ -90,9 +86,45 @@ fn main() -> Result<()> {
         app_version: gow_meet_core::version().into() };
     let started = meta.started;
     let writer = SessionWriter::create(&a.out, meta)?;
-    let sink = Arc::new(Term { start: Instant::now(), silence_close_ms: cfg.segmenter.silence_close_ms,
+    let sink = Arc::new(Term { start: Instant::now(), silence_close_ms,
         finals: Mutex::new(vec![]), partials: Mutex::new(vec![]) });
     let p = Pipeline::start(cfg, Box::new(asr), Box::new(tr), writer, sink.clone());
+    if a.live {
+        use gow_meet_core::capture::{AudioSource, CaptureEvent, MicSource, SystemSource};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut mic = MicSource::new();
+        let mut sys = SystemSource::new();
+        if let Err(e) = sys.start(tx.clone()) { eprintln!("! áudio do sistema: {e}"); }
+        if let Err(e) = mic.start(tx) { sys.stop(); return Err(e); }
+        eprintln!("Capturando. Ctrl+C para encerrar.");
+        let stop = Arc::new(AtomicBool::new(false));
+        { let s = stop.clone(); ctrlc::set_handler(move || s.store(true, Ordering::SeqCst))?; }
+        let t0 = Instant::now();
+        while !stop.load(Ordering::SeqCst) {
+            match rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(CaptureEvent::Audio { source, samples }) => p.feed(source, &samples),
+                Ok(CaptureEvent::Reconnecting(s)) => eprintln!("! reconectando {s:?}"),
+                Ok(CaptureEvent::Error { source, message }) => eprintln!("! {source:?}: {message}"),
+                Err(_) => {}
+            }
+        }
+        mic.stop();
+        sys.stop();
+        // `ended` é Unix ms: início da sessão + tempo decorrido.
+        let md = p.finish(started + t0.elapsed().as_millis() as u64)?;
+        eprintln!("transcrição: {}", md.display());
+        return Ok(());
+    }
+    let wav = a.wav.clone().context("informe um WAV ou --live")?;
+    let one = read_wav_16k_mono(&wav)?;
+    // Silêncio entre cópias: fecha a última fala de cada cópia (silence_close_ms + 1 s de margem).
+    let gap = vec![0.0f32; ((silence_close_ms + 1_000) * 16) as usize];
+    let mut audio: Vec<f32> = Vec::new();
+    for i in 0..a.repeat {
+        if i > 0 { audio.extend_from_slice(&gap); }
+        audio.extend_from_slice(&one);
+    }
     for (i, chunk) in audio.chunks(1_600).enumerate() {
         if !a.fast {
             let due = sink.start + Duration::from_millis((i as u64 + 1) * 100);

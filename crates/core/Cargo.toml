@@ -15,6 +15,7 @@ tracing.workspace = true
 crossbeam-channel.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
+cpal = "0.15"
 sha2 = "0.10"
 hex = "0.4"
 hound = "3.5"
@@ -26,6 +27,8 @@ tempfile = "3"
 [target.'cfg(target_os = "macos")'.dependencies]
 whisper-rs = { version = "0.14", features = ["metal"] }
 ct2rs = { version = "0.9", features = ["accelerate"] }
+screencapturekit = "0.3"
+core-media-rs = "0.3"
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 whisper-rs = { version = "0.14" }

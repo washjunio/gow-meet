@@ -1,4 +1,5 @@
 pub mod asr;
+pub mod capture;
 pub mod models;
 pub mod pipeline;
 pub mod resample;
