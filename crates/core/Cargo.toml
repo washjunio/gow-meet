@@ -17,7 +17,18 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 
 sha2 = "0.10"
 hex = "0.4"
+hound = "3.5"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 
 [dev-dependencies]
 tempfile = "3"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+whisper-rs = { version = "0.14", features = ["metal"] }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+whisper-rs = { version = "0.14" }
+
+[features]
+vulkan = ["whisper-rs/vulkan"]
+cuda = ["whisper-rs/cuda"]

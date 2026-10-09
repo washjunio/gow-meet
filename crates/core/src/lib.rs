@@ -1,7 +1,10 @@
+pub mod asr;
 pub mod models;
 pub mod resample;
 pub mod segmenter;
 pub mod session;
+pub mod wav;
+pub mod wer;
 
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
