@@ -1,0 +1,9 @@
+/target
+/dist
+/node_modules
+src-tauri/gen/schemas
+*.log
+/models
+.DS_Store
+.venv-convert/
+gow-meet-cli-out/

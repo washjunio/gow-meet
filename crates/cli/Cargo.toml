@@ -1,0 +1,8 @@
+[package]
+name = "gow-meet-cli"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+gow-meet-core = { path = "../core" }
+anyhow.workspace = true
