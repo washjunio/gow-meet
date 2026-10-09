@@ -103,6 +103,8 @@ fn main() -> Result<()> {
         if let Err(e) = sys.start(tx.clone()) { eprintln!("! áudio do sistema: {e}"); }
         if let Err(e) = mic.start(tx) { sys.stop(); return Err(e); }
         eprintln!("Capturando. Ctrl+C para encerrar.");
+        // Fontes caladas (ScreenCaptureKit sem áudio) são completadas a cada ~100 ms.
+        let mut last_fill = Instant::now();
         while !stop.load(Ordering::SeqCst) {
             match rx.recv_timeout(Duration::from_millis(200)) {
                 Ok(CaptureEvent::Audio { source, samples }) =>
@@ -110,6 +112,10 @@ fn main() -> Result<()> {
                 Ok(CaptureEvent::Reconnecting(s)) => eprintln!("! reconectando {s:?}"),
                 Ok(CaptureEvent::Error { source, message }) => eprintln!("! {source:?}: {message}"),
                 Err(_) => {}
+            }
+            if last_fill.elapsed() >= Duration::from_millis(100) {
+                last_fill = Instant::now();
+                clock.fill_to(t0.elapsed(), |source, x| p.feed(source, x));
             }
         }
         mic.stop();

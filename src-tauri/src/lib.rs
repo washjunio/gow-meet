@@ -234,6 +234,9 @@ fn build_session(app: &AppHandle, st: &AppState, title: Option<String>) -> Resul
             // Lacunas de entrega (reconexão, ScreenCaptureKit calado) viram silêncio, para o
             // t0 de cada fonte acompanhar o relógio e a ordem das falas na janela flutuante.
             let mut clock = SourceClock::default();
+            // O ScreenCaptureKit não entrega nada no silêncio: a cada ~100 ms completa as
+            // fontes atrasadas, para o segmentador fechar a última fala do participante.
+            let mut last_fill = Instant::now();
             while !stop.load(Ordering::SeqCst) {
                 match rx.recv_timeout(Duration::from_millis(200)) {
                     Ok(CaptureEvent::Audio { source, samples }) =>
@@ -247,6 +250,10 @@ fn build_session(app: &AppHandle, st: &AppState, title: Option<String>) -> Resul
                         let _ = app.emit("gow-meet", UiEvent::Error { message });
                     }
                     Err(_) => {}
+                }
+                if last_fill.elapsed() >= Duration::from_millis(100) {
+                    last_fill = Instant::now();
+                    clock.fill_to(t0.elapsed(), |source, x| pipeline.feed(source, x));
                 }
             }
         }).map_err(|e| e.to_string())?

@@ -6,6 +6,10 @@ use std::time::Duration;
 /// Atraso tolerado antes de completar uma fonte com silêncio.
 pub const DEFAULT_MAX_BEHIND_MS: u64 = 300;
 
+/// Atraso tolerado no `fill_to` periódico: maior que o do caminho por pedaço, para
+/// absorver o jitter de entrega sem preencher à toa.
+pub const DEFAULT_TICK_BEHIND_MS: u64 = 400;
+
 const PER_MS: u64 = SAMPLE_RATE as u64 / 1_000;
 /// Zeros são entregues em pedaços de 1 s para não alocar lacunas longas de uma vez.
 static ZERO_CHUNK: [f32; SAMPLE_RATE as usize] = [0.0; SAMPLE_RATE as usize];
@@ -20,11 +24,13 @@ static ZERO_CHUNK: [f32; SAMPLE_RATE as usize] = [0.0; SAMPLE_RATE as usize];
 pub struct SourceClock {
     fed: HashMap<SpeakerSource, u64>,
     max_behind: u64,
+    tick_behind: u64,
 }
 
 impl SourceClock {
     pub fn new(max_behind_ms: u64) -> Self {
-        Self { fed: HashMap::new(), max_behind: max_behind_ms * PER_MS }
+        Self { fed: HashMap::new(), max_behind: max_behind_ms * PER_MS,
+               tick_behind: DEFAULT_TICK_BEHIND_MS * PER_MS }
     }
 
     /// Quantos zeros entregar antes de um pedaço de `incoming` amostras que chegou
@@ -50,6 +56,25 @@ impl SourceClock {
             gap -= n as u64;
         }
         feed(samples);
+    }
+
+    /// Completa com silêncio as fontes que já entregaram e estão mais de 400 ms atrás de
+    /// `elapsed`, sem esperar o próximo pedaço. O ScreenCaptureKit não entrega nada enquanto
+    /// não toca áudio, e sem esse silêncio o segmentador nunca fecha a última fala.
+    /// Fontes que nunca entregaram não recebem nada. `feed` recebe a fonte e os zeros
+    /// (em pedaços de até 1 s).
+    pub fn fill_to(&mut self, elapsed: Duration, mut feed: impl FnMut(SpeakerSource, &[f32])) {
+        let expected = (elapsed.as_micros() as u64).saturating_mul(PER_MS) / 1_000;
+        for (&source, fed) in self.fed.iter_mut() {
+            let mut gap = expected.saturating_sub(*fed);
+            if gap <= self.tick_behind { continue; }
+            *fed += gap;
+            while gap > 0 {
+                let n = gap.min(ZERO_CHUNK.len() as u64) as usize;
+                feed(source, &ZERO_CHUNK[..n]);
+                gap -= n as u64;
+            }
+        }
     }
 }
 
@@ -115,5 +140,67 @@ mod tests {
         assert_eq!(c.gap_before(Mic, ms(0), 0), 0);
         // só volta a preencher quando o relógio passa a fonte de novo
         assert_eq!(c.gap_before(Mic, ms(10_000), 0), 10_000 * 16 - 81_600);
+    }
+
+    /// Soma de zeros entregues por `fill_to`, por fonte.
+    fn fill(c: &mut SourceClock, at_ms: u64) -> HashMap<SpeakerSource, usize> {
+        let mut out = HashMap::new();
+        c.fill_to(ms(at_ms), |s, x| {
+            assert!(x.iter().all(|&v| v == 0.0));
+            *out.entry(s).or_insert(0) += x.len();
+        });
+        out
+    }
+
+    #[test]
+    fn fill_to_completes_a_silent_source() {
+        let mut c = SourceClock::default();
+        assert_eq!(feed(&mut c, System, 1_000, 16_000), (0, 16_000));
+        let z = fill(&mut c, 2_000);
+        assert_eq!(z.get(&System), Some(&16_000));
+    }
+
+    #[test]
+    fn fill_to_ignores_sources_that_never_delivered() {
+        let mut c = SourceClock::default();
+        assert!(fill(&mut c, 5_000).is_empty());
+    }
+
+    #[test]
+    fn fill_to_ignores_on_time_and_jittery_sources() {
+        let mut c = SourceClock::default();
+        feed(&mut c, Mic, 1_000, 16_000);
+        assert!(fill(&mut c, 1_100).is_empty());
+        assert!(fill(&mut c, 1_400).is_empty()); // dentro dos 400 ms de tolerância
+    }
+
+    #[test]
+    fn fill_to_does_not_double_fill() {
+        let mut c = SourceClock::default();
+        feed(&mut c, System, 1_000, 16_000);
+        assert_eq!(fill(&mut c, 2_000).get(&System), Some(&16_000));
+        assert!(fill(&mut c, 2_000).is_empty());
+        assert!(fill(&mut c, 2_100).is_empty());
+        // o próximo pedaço real, em dia com a linha do tempo, também não ganha zeros
+        assert_eq!(feed(&mut c, System, 2_100, 1_600), (0, 1_600));
+    }
+
+    #[test]
+    fn fill_to_is_per_source() {
+        let mut c = SourceClock::default();
+        feed(&mut c, Mic, 2_000, 32_000); // em dia
+        feed(&mut c, System, 1_000, 16_000); // 1 s atrás
+        let z = fill(&mut c, 2_000);
+        assert_eq!(z.get(&System), Some(&16_000));
+        assert_eq!(z.get(&Mic), None);
+    }
+
+    #[test]
+    fn fill_to_splits_long_gaps_into_one_second_chunks() {
+        let mut c = SourceClock::default();
+        feed(&mut c, System, 100, 1_600);
+        let mut sizes = vec![];
+        c.fill_to(ms(2_600), |_, x| sizes.push(x.len()));
+        assert_eq!(sizes, vec![16_000, 16_000, 8_000]);
     }
 }
