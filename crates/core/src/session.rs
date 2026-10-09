@@ -152,7 +152,7 @@ pub fn render_markdown(meta: &Meta, lines: &[Line]) -> String {
 
 /// Encerra sessões sem `ended` (app fechou no meio). `ended` = início + último t1,
 /// ou `now_ms` se não houver falas.
-pub fn recover_unfinished(root: &Path, now_ms: u64) -> Result<Vec<PathBuf>> {
+pub fn recover_unfinished(root: &Path, _now_ms: u64) -> Result<Vec<PathBuf>> {
     let mut done = vec![];
     let Ok(entries) = fs::read_dir(root) else { return Ok(done) };
     for entry in entries.flatten() {
@@ -163,7 +163,7 @@ pub fn recover_unfinished(root: &Path, now_ms: u64) -> Result<Vec<PathBuf>> {
         // Uma sessão defeituosa não pode impedir a recuperação das demais.
         // Só o caminho é logado: o conteúdo das falas nunca vai para o log.
         let result = replay(&dir.join("lines.jsonl")).and_then(|lines| {
-            meta.ended = Some(lines.iter().map(|l| l.t1).max().map_or(now_ms, |t| meta.started + t));
+            meta.ended = Some(lines.iter().map(|l| l.t1).max().map_or(meta.started, |t| meta.started + t));
             close_session(&dir, &meta)
         });
         match result {
@@ -259,6 +259,17 @@ mod tests {
         assert_eq!(m.ended, Some(1_000 + 2_500)); // started + último t1
         assert!(root.path().join("s5/transcript.md").exists());
         assert!(recover_unfinished(root.path(), 99_000).unwrap().is_empty());
+    }
+
+    #[test]
+    fn recover_session_without_lines_ends_at_start() {
+        let root = tempfile::tempdir().unwrap();
+        let w = SessionWriter::create(root.path(), meta("vazia")).unwrap();
+        drop(w); // queda antes de qualquer fala
+        let done = recover_unfinished(root.path(), 99_000).unwrap();
+        assert_eq!(done.len(), 1);
+        let m: Meta = serde_json::from_slice(&std::fs::read(root.path().join("vazia/meta.json")).unwrap()).unwrap();
+        assert_eq!(m.ended, Some(m.started));
     }
 
     #[test]
