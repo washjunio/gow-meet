@@ -80,3 +80,9 @@ impl AudioSource for SystemSource {
         if let Some(s) = self.stream.take() { let _ = s.stop_capture(); }
     }
 }
+
+/// `SCStream::drop` libera os handlers sem chamar stopCapture; parar antes evita que o
+/// ScreenCaptureKit chame memória liberada. `stop` é idempotente.
+impl Drop for SystemSource {
+    fn drop(&mut self) { self.stop(); }
+}

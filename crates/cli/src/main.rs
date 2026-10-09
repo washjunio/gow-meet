@@ -92,14 +92,14 @@ fn main() -> Result<()> {
     if a.live {
         use gow_meet_core::capture::{AudioSource, CaptureEvent, MicSource, SystemSource};
         use std::sync::atomic::{AtomicBool, Ordering};
+        let stop = Arc::new(AtomicBool::new(false));
+        { let s = stop.clone(); ctrlc::set_handler(move || s.store(true, Ordering::SeqCst))?; }
         let (tx, rx) = crossbeam_channel::unbounded();
         let mut mic = MicSource::new();
         let mut sys = SystemSource::new();
         if let Err(e) = sys.start(tx.clone()) { eprintln!("! áudio do sistema: {e}"); }
         if let Err(e) = mic.start(tx) { sys.stop(); return Err(e); }
         eprintln!("Capturando. Ctrl+C para encerrar.");
-        let stop = Arc::new(AtomicBool::new(false));
-        { let s = stop.clone(); ctrlc::set_handler(move || s.store(true, Ordering::SeqCst))?; }
         let t0 = Instant::now();
         while !stop.load(Ordering::SeqCst) {
             match rx.recv_timeout(Duration::from_millis(200)) {
