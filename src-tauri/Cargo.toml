@@ -18,9 +18,20 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2.7.1", features = [] }
 
 [dependencies]
-serde_json = "1.0"
-serde = { version = "1.0", features = ["derive"] }
-log = "0.4"
-tauri = { version = "2.12.1", features = [] }
-tauri-plugin-log = "2"
+serde = { workspace = true }
+serde_json = { workspace = true }
+tauri = { version = "2.12.1", features = ["macos-private-api"] }
 gow-meet-core = { path = "../crates/core" }
+crossbeam-channel = { workspace = true }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+tracing = { workspace = true }
+tracing-subscriber = "0.3"
+tracing-appender = "0.2"
+tauri-plugin-opener = "2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[features]
+vulkan = ["gow-meet-core/vulkan"]
+cuda = ["gow-meet-core/cuda"]

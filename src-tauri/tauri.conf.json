@@ -10,13 +10,31 @@
     "beforeBuildCommand": "npm run build"
   },
   "app": {
+    "macOSPrivateApi": true,
     "windows": [
       {
+        "label": "main",
         "title": "gow-meet",
-        "width": 800,
-        "height": 600,
+        "url": "index.html",
+        "width": 900,
+        "height": 640
+      },
+      {
+        "label": "overlay",
+        "title": "gow-meet legendas",
+        "url": "index.html#overlay",
+        "width": 440,
+        "height": 320,
+        "x": 40,
+        "y": 80,
+        "transparent": true,
+        "decorations": false,
+        "alwaysOnTop": true,
+        "visibleOnAllWorkspaces": true,
+        "skipTaskbar": true,
         "resizable": true,
-        "fullscreen": false
+        "shadow": false,
+        "visible": false
       }
     ],
     "security": {
