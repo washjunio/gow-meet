@@ -1,6 +1,6 @@
 # Modelos para reuniões em português (etapa 3)
 
-Máquina: Mac M2 8 GB · Data: 10/10/2026 · Commit: este commit
+Máquina: Mac M2 8 GB · Data: 10/10/2026 · Commit: 0cd6e92
 
 ## Transcrição (Whisper, idioma pt, frases fictícias da voz Luciana)
 
@@ -10,7 +10,7 @@ Máquina: Mac M2 8 GB · Data: 10/10/2026 · Commit: este commit
 
 Parcial (transcrição) no CLI: p50 520 ms, p90 607 ms.
 
-EN com o `small` multilíngue: WER 0,00 nas cinco frases, igual ao `small.en`. O teste `asr_whisper` tem um terceiro teste que falha com o `small.en` nesta máquina; não foi investigado aqui (fora do escopo desta medição). Ou seja, o "modelo único" seria viável em precisão para EN, mas a decisão da spec (EN continua com `small.en`) não muda.
+EN com o `small` multilíngue: WER 0,00 nas cinco frases, igual ao `small.en`. Um terceiro teste do `asr_whisper` com o `small.en` falhou uma vez numa execução e passou 4/4 ao repetir (intermitente, não reproduzido). Ou seja, o "modelo único" seria viável em precisão para EN, mas a decisão da spec (EN continua com `small.en`) não muda.
 
 ## Tradução pt→en (CTranslate2 int8)
 
