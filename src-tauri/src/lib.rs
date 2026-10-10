@@ -1,8 +1,10 @@
 mod config;
+mod language;
 
 use config::Config;
 use gow_meet_core::asr::WhisperTranscriber;
 use gow_meet_core::capture::{AudioSource, CaptureEvent, MicSource, SourceClock, SystemSource};
+use gow_meet_core::lang::Lang;
 use gow_meet_core::models::{self, HttpFetch};
 use gow_meet_core::pipeline::{Pipeline, PipelineConfig, PipelineEvent, Sink, SpeakerId};
 use gow_meet_core::session::{recover_unfinished, session_id, Line, Meta, SessionWriter, Speaker, SpeakerSource};
@@ -10,7 +12,9 @@ use gow_meet_core::speaker::TractEmbedder;
 use gow_meet_core::tracker::SpeakerTracker;
 use gow_meet_core::translate::Ct2Translator;
 use gow_meet_core::voices::{VoiceLibrary, VoiceSummary, VOICES_FILE};
+use language::{LangState, Step};
 use serde::Serialize;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -22,7 +26,7 @@ use tauri::{AppHandle, Emitter, Manager, RunEvent, WindowEvent};
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum UiEvent {
-    Partial { id: String, speaker: Speaker, t0: u64, text: String, translation: Option<String> },
+    Partial { id: String, speaker: Speaker, t0: u64, text: String, translation: Option<String>, lang: Lang },
     Final { line: Line },
     Translated { line: Line },
     Dropped { id: String },
@@ -32,6 +36,21 @@ pub enum UiEvent {
     Stopped { transcript: String },
     /// Grupo de voz renomeado: as duas janelas trocam o rótulo de todas as falas dele.
     Speaker { voice: String, label: String },
+    /// Idioma da reunião: `preparing` (com `progress` de 0 a 1 enquanto baixa), `active` ou `failed`.
+    Language {
+        lang: Lang,
+        status: LangStatus,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        progress: Option<f32>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LangStatus { Preparing, Active, Failed }
+
+fn emit_language(app: &AppHandle, lang: Lang, status: LangStatus, progress: Option<f32>) {
+    let _ = app.emit("gow-meet", UiEvent::Language { lang, status, progress });
 }
 
 struct TauriSink(AppHandle);
@@ -39,8 +58,8 @@ struct TauriSink(AppHandle);
 impl Sink for TauriSink {
     fn emit(&self, ev: PipelineEvent) {
         let ui = match ev {
-            PipelineEvent::Partial { id, speaker, t0, text, translation, .. } =>
-                UiEvent::Partial { id, speaker, t0, text, translation },
+            PipelineEvent::Partial { id, speaker, t0, text, translation, lang, .. } =>
+                UiEvent::Partial { id, speaker, t0, text, translation, lang },
             PipelineEvent::Final(line) => UiEvent::Final { line },
             PipelineEvent::Translated(line) => UiEvent::Translated { line },
             PipelineEvent::Dropped { id } => UiEvent::Dropped { id },
@@ -64,6 +83,9 @@ struct Running {
     pump: JoinHandle<()>,
     started: Instant,
     started_ms: u64,
+    /// Identifica a sessão para o preparo do outro idioma, que roda fora do slot.
+    id: String,
+    lang: Arc<Mutex<LangState>>,
 }
 
 enum Slot {
@@ -73,20 +95,21 @@ enum Slot {
     Stopping,
 }
 
+/// Modelos de um idioma já verificados (hash).
 #[derive(Clone)]
-struct ModelPaths {
-    whisper: PathBuf,
-    opus_dir: PathBuf,
-    /// Arquivo do modelo de voz; `None` se não foi possível baixá-lo (a reunião segue sem
-    /// identificar quem fala, e a próxima reunião tenta de novo).
-    speaker: Option<PathBuf>,
-}
+struct PairPaths { whisper: PathBuf, opus_dir: PathBuf }
 
 struct AppState {
     config: Config,
     slot: Mutex<Slot>,
-    /// Modelos já verificados (hash) nesta execução do app.
-    models: Mutex<Option<ModelPaths>>,
+    /// Pares já verificados nesta execução do app.
+    pairs: Mutex<HashMap<Lang, PairPaths>>,
+    /// Arquivo do modelo de voz já verificado; `None`: ainda não, ou falhou (a próxima
+    /// reunião tenta de novo e, sem ele, a reunião segue sem identificar quem fala).
+    speaker: Mutex<Option<PathBuf>>,
+    /// Um download/verificação por vez: o preparo do outro idioma pode continuar depois
+    /// que a reunião acaba e não pode escrever no mesmo `.part` que a reunião seguinte.
+    ensuring: Mutex<()>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -133,49 +156,92 @@ impl Throttle {
     }
 }
 
-fn ensure_one(app: &AppHandle, cfg: &Config, id: &str) -> Result<PathBuf, String> {
+fn ensure_one(app: &AppHandle, cfg: &Config, id: &str, on_progress: &mut dyn FnMut(&str, u64, Option<u64>))
+    -> Result<PathBuf, String> {
     let spec = models::manifest().remove(id).ok_or(format!("modelo {id} fora do manifesto"))?;
     let dir = local_root(app)?.join("models").join(id);
-    let app2 = app.clone();
-    let mut throttles: std::collections::HashMap<String, Throttle> = Default::default();
     let base = std::env::var("GOW_MEET_MODELS_URL").unwrap_or_else(|_| cfg.models_base_url.clone());
-    models::ensure(&spec, &base, &dir, &HttpFetch::default(), &mut |file, done, total| {
-        let th = throttles.entry(file.to_string()).or_insert_with(Throttle::new);
-        if th.allow(Instant::now(), done, total) {
-            let _ = app2.emit("models-progress", serde_json::json!({"file": file, "done": done, "total": total}));
-        }
-    }).map_err(|e| {
+    models::ensure(&spec, &base, &dir, &HttpFetch::default(), on_progress).map_err(|e| {
         tracing::error!("baixar modelo {id}: {e:#}");
         format!("baixar modelo {id}: {e:#}")
     })?;
     Ok(dir)
 }
 
-/// Verifica/baixa os modelos uma vez por execução do app. O modelo de voz é opcional:
-/// sem ele a reunião segue como na etapa 1.
-fn ensure_all(app: &AppHandle, st: &AppState) -> Result<ModelPaths, String> {
-    let mut cached = lock(&st.models);
-    let mut paths = match cached.clone() {
-        Some(p) => p,
-        None => {
-            let whisper_dir = ensure_one(app, &st.config, &st.config.whisper_model)?;
-            let spec = models::manifest().remove(&st.config.whisper_model)
-                .ok_or(format!("modelo {} fora do manifesto", st.config.whisper_model))?;
-            let opus_dir = ensure_one(app, &st.config, &st.config.opus_model)?;
-            ModelPaths { whisper: whisper_dir.join(&spec.files[0].name), opus_dir, speaker: None }
+/// Progresso para a janela principal (evento `models-progress`), ~4 por segundo por arquivo.
+fn main_progress(app: &AppHandle) -> impl FnMut(&str, u64, Option<u64>) + '_ {
+    let mut throttles: HashMap<String, Throttle> = HashMap::new();
+    move |file, done, total| {
+        let th = throttles.entry(file.to_string()).or_insert_with(Throttle::new);
+        if th.allow(Instant::now(), done, total) {
+            let _ = app.emit("models-progress", serde_json::json!({"file": file, "done": done, "total": total}));
         }
-    };
-    if paths.speaker.is_none() { paths.speaker = ensure_speaker(app, &st.config); }
-    *cached = Some(paths.clone());
-    Ok(paths)
+    }
 }
 
-fn ensure_speaker(app: &AppHandle, cfg: &Config) -> Option<PathBuf> {
+/// Roda `f` com o lock de downloads.
+fn serialized<T>(lock_: &Mutex<()>, f: impl FnOnce() -> T) -> T {
+    let _g = lock(lock_);
+    f()
+}
+
+/// Garante (baixa e confere o hash, uma vez por execução do app) os modelos de `lang`.
+fn ensure_pair(app: &AppHandle, st: &AppState, lang: Lang, on_progress: &mut dyn FnMut(&str, u64, Option<u64>))
+    -> Result<PairPaths, String> {
+    serialized(&st.ensuring, || {
+        if let Some(p) = lock(&st.pairs).get(&lang) { return Ok(p.clone()); }
+        let pair = st.config.pair(lang);
+        let whisper_dir = ensure_one(app, &st.config, &pair.whisper, on_progress)?;
+        let file = models::manifest().remove(&pair.whisper).and_then(|s| s.files.into_iter().next())
+            .ok_or(format!("modelo {} fora do manifesto", pair.whisper))?.name;
+        let opus_dir = ensure_one(app, &st.config, &pair.opus, on_progress)?;
+        let paths = PairPaths { whisper: whisper_dir.join(file), opus_dir };
+        lock(&st.pairs).insert(lang, paths.clone());
+        Ok(paths)
+    })
+}
+
+/// Os arquivos de `lang` já estão no disco (sem conferir o hash): ao iniciar, o outro
+/// idioma só é pré-carregado se não precisar baixar nada.
+fn pair_on_disk(app: &AppHandle, cfg: &Config, lang: Lang) -> bool {
+    let Ok(root) = local_root(app) else { return false };
+    let pair = cfg.pair(lang);
+    let manifest = models::manifest();
+    [&pair.whisper, &pair.opus].into_iter().all(|id| manifest.get(id.as_str()).is_some_and(|s|
+        s.files.iter().all(|f| root.join("models").join(id).join(&f.name).is_file())))
+}
+
+/// Modelo de voz: verificado uma vez por execução; falha não impede a reunião.
+fn ensure_speaker(app: &AppHandle, st: &AppState) -> Option<PathBuf> {
+    if let Some(p) = lock(&st.speaker).clone() { return Some(p); }
+    let cfg = &st.config;
     let Some(name) = models::manifest().get(&cfg.speaker_model).and_then(|s| s.files.first()).map(|f| f.name.clone()) else {
         tracing::warn!(model = %cfg.speaker_model, "modelo de voz fora do manifesto");
         return None;
     };
-    ensure_one(app, cfg, &cfg.speaker_model).ok().map(|dir| dir.join(name))
+    let path = serialized(&st.ensuring, || ensure_one(app, cfg, &cfg.speaker_model, &mut main_progress(app)))
+        .ok().map(|dir| dir.join(name));
+    lock(&st.speaker).clone_from(&path);
+    path
+}
+
+/// Carrega Whisper (GPU; sem ela, processador) e Opus-MT de `lang`. Só o par inicial
+/// avisa na tela da falta de GPU; o segundo par só registra no log.
+fn load_pair(app: &AppHandle, cfg: &Config, lang: Lang, paths: &PairPaths, warn_gpu: bool)
+    -> Result<(WhisperTranscriber, Ct2Translator), String> {
+    let asr = match WhisperTranscriber::new(&paths.whisper, lang.code(), true) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(lang = lang.code(), "GPU indisponível para o Whisper: {e:#}");
+            if warn_gpu {
+                let _ = app.emit("gow-meet", UiEvent::Error {
+                    message: "GPU indisponível: usando o processador, a tradução ficará mais lenta.".into() });
+            }
+            WhisperTranscriber::new(&paths.whisper, lang.code(), false).map_err(|e| format!("{e:#}"))?
+        }
+    };
+    let tr = Ct2Translator::new(&paths.opus_dir, cfg.pair(lang).prefix).map_err(|e| format!("{e:#}"))?;
+    Ok((asr, tr))
 }
 
 pub const SPEAKER_UNAVAILABLE: &str =
@@ -215,20 +281,22 @@ fn speaker_setup(app: &AppHandle, cfg: &Config, model: Option<&Path>) -> Option<
 }
 
 #[tauri::command]
-async fn ensure_models(app: AppHandle) -> Result<(), String> {
+async fn ensure_models(app: AppHandle, lang: Lang) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         let st = app.state::<AppState>();
-        ensure_all(&app, &st).map(|_| ())
+        ensure_pair(&app, &st, lang, &mut main_progress(&app))?;
+        ensure_speaker(&app, &st);
+        Ok(())
     }).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-async fn start_session(app: AppHandle, title: Option<String>) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || start_blocking(&app, title))
+async fn start_session(app: AppHandle, title: Option<String>, lang: Lang) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || start_blocking(&app, title, lang))
         .await.map_err(|e| e.to_string())?
 }
 
-fn start_blocking(app: &AppHandle, title: Option<String>) -> Result<String, String> {
+fn start_blocking(app: &AppHandle, title: Option<String>, lang: Lang) -> Result<String, String> {
     let st = app.state::<AppState>();
     {
         // Marca "starting" antes do carregamento lento: uma segunda chamada é rejeitada.
@@ -236,9 +304,11 @@ fn start_blocking(app: &AppHandle, title: Option<String>) -> Result<String, Stri
         if !matches!(*slot, Slot::Idle) { return Err("já existe uma reunião em andamento".into()); }
         *slot = Slot::Starting;
     }
-    match build_session(app, &st, title) {
+    match build_session(app, &st, title, lang) {
         Ok((run, id)) => {
             *lock(&st.slot) = Slot::Running(Box::new(run));
+            emit_language(app, lang, LangStatus::Active, None);
+            preload_other(app, &st, lang);
             if let Some(w) = app.get_webview_window("overlay") { let _ = w.show(); }
             tracing::info!(session = %id, "sessão iniciada");
             Ok(id)
@@ -251,21 +321,15 @@ fn start_blocking(app: &AppHandle, title: Option<String>) -> Result<String, Stri
     }
 }
 
-fn build_session(app: &AppHandle, st: &AppState, title: Option<String>) -> Result<(Running, String), String> {
+fn build_session(app: &AppHandle, st: &AppState, title: Option<String>, lang: Lang)
+    -> Result<(Running, String), String> {
     let cfg = &st.config;
-    let paths = ensure_all(app, st)?;
-    let asr = match WhisperTranscriber::new(&paths.whisper, &cfg.source_lang, true) {
-        Ok(t) => t,
-        Err(e) => {
-            tracing::warn!("GPU indisponível para o Whisper: {e:#}");
-            let _ = app.emit("gow-meet", UiEvent::Error {
-                message: "GPU indisponível: usando o processador, a tradução ficará mais lenta.".into() });
-            WhisperTranscriber::new(&paths.whisper, &cfg.source_lang, false).map_err(|e| format!("{e:#}"))?
-        }
-    };
-    let tr = Ct2Translator::new(&paths.opus_dir, cfg.opus_prefix.clone()).map_err(|e| format!("{e:#}"))?;
-    let speakers = speaker_setup(app, cfg, paths.speaker.as_deref());
-    let mut model_ids = vec![("asr".to_string(), cfg.whisper_model.clone()), ("translate".to_string(), cfg.opus_model.clone())];
+    let paths = ensure_pair(app, st, lang, &mut main_progress(app))?;
+    let speaker_model = ensure_speaker(app, st);
+    let (asr, tr) = load_pair(app, cfg, lang, &paths, true)?;
+    let speakers = speaker_setup(app, cfg, speaker_model.as_deref());
+    let pair = cfg.pair(lang);
+    let mut model_ids = vec![("asr".to_string(), pair.whisper.clone()), ("translate".to_string(), pair.opus.clone())];
     if speakers.is_some() { model_ids.push(("speaker".to_string(), cfg.speaker_model.clone())); }
     let now = chrono::Local::now();
     let id = session_id(now);
@@ -275,12 +339,12 @@ fn build_session(app: &AppHandle, st: &AppState, title: Option<String>) -> Resul
         title: title.filter(|t| !t.trim().is_empty())
             .unwrap_or_else(|| format!("Reunião {}", now.format("%d/%m/%Y %H:%M"))),
         started: started_ms, ended: None,
-        source_lang: cfg.source_lang.clone(), target_lang: cfg.target_lang.clone(),
+        source_lang: lang.code().into(), target_lang: lang.other().code().into(),
         models: model_ids.into_iter().collect(),
         app_version: env!("CARGO_PKG_VERSION").into(),
     };
     let writer = SessionWriter::create(&root(app)?.join("sessions"), meta).map_err(|e| format!("{e:#}"))?;
-    let pipeline = Arc::new(Pipeline::start_with_speakers(PipelineConfig::default(), Box::new(asr), Box::new(tr),
+    let pipeline = Arc::new(Pipeline::start_with_speakers(PipelineConfig { lang, ..PipelineConfig::default() }, Box::new(asr), Box::new(tr),
                                                           speakers, writer, Arc::new(TauriSink(app.clone()))));
     let (tx, rx) = crossbeam_channel::unbounded();
     // Início da linha do tempo das fontes: antes de abri-las.
@@ -327,7 +391,94 @@ fn build_session(app: &AppHandle, st: &AppState, title: Option<String>) -> Resul
             }
         }).map_err(|e| e.to_string())?
     };
-    Ok((Running { pipeline, mic, sys, stop, pump, started: Instant::now(), started_ms }, id))
+    Ok((Running { pipeline, mic, sys, stop, pump, started: Instant::now(), started_ms,
+                  id: id.clone(), lang: Arc::new(Mutex::new(LangState::new(lang))) }, id))
+}
+
+/// Pré-carrega o outro idioma em segundo plano se ele já está no disco (troca instantânea).
+fn preload_other(app: &AppHandle, st: &AppState, lang: Lang) {
+    let other = lang.other();
+    if !pair_on_disk(app, &st.config, other) { return; }
+    let slot = lock(&st.slot);
+    let Slot::Running(run) = &*slot else { return };
+    if lock(&run.lang).preload(other) { spawn_prepare(app.clone(), run.id.clone(), run.lang.clone(), other); }
+}
+
+/// A sessão `id` ainda está rodando: o preparo do outro idioma só entrega modelos a ela.
+fn same_session<'a>(slot: &'a Slot, id: &str) -> Option<&'a Running> {
+    match slot { Slot::Running(run) if run.id == id => Some(run), _ => None }
+}
+
+fn switch_now(app: &AppHandle, run: &Running, state: &mut LangState, lang: Lang) {
+    run.pipeline.set_language(lang);
+    state.switched(lang);
+    emit_language(app, lang, LangStatus::Active, None);
+}
+
+/// Prepara o par de `lang` numa thread própria: baixa (se preciso), confere, carrega e
+/// entrega ao pipeline da sessão `session`. A thread nunca guarda o pipeline: se a sessão
+/// acabou (ou é outra), os modelos são descartados.
+fn spawn_prepare(app: AppHandle, session: String, state: Arc<Mutex<LangState>>, lang: Lang) {
+    let spawned = std::thread::Builder::new().name("prepare-lang".into()).spawn(move || {
+        let t0 = Instant::now();
+        let st = app.state::<AppState>();
+        let mut throttle = Throttle::new();
+        let mut on_progress = |_: &str, done: u64, total: Option<u64>| {
+            // O pré-carregamento é silencioso: só mostra progresso se o usuário pediu este idioma.
+            if lock(&state).wanted() != lang { return; }
+            let Some(total) = total.filter(|t| *t > 0) else { return };
+            if throttle.allow(Instant::now(), done, Some(total)) {
+                emit_language(&app, lang, LangStatus::Preparing, Some(done as f32 / total as f32));
+            }
+        };
+        let loaded = ensure_pair(&app, &st, lang, &mut on_progress)
+            .and_then(|paths| load_pair(&app, &st.config, lang, &paths, false));
+        let slot = lock(&st.slot);
+        let Some(run) = same_session(&slot, &session) else { return };
+        let mut ls = lock(&run.lang);
+        match loaded {
+            Ok((asr, tr)) => {
+                tracing::info!(lang = lang.code(), ms = t0.elapsed().as_millis() as u64, "par de idioma pronto");
+                let pair = st.config.pair(lang);
+                run.pipeline.add_models(BTreeMap::from([
+                    (format!("asr_{}", lang.code()), pair.whisper), (format!("translate_{}", lang.code()), pair.opus)]));
+                run.pipeline.add_language(lang, Box::new(asr), Box::new(tr));
+                if let Some(l) = ls.loaded(lang) { switch_now(&app, run, &mut ls, l); }
+            }
+            Err(e) => {
+                tracing::warn!(lang = lang.code(), "par de idioma não preparado: {e}");
+                if ls.failed(lang) {
+                    emit_language(&app, lang, LangStatus::Failed, None);
+                    emit_language(&app, ls.active(), LangStatus::Active, None);
+                }
+            }
+        }
+    });
+    if let Err(e) = spawned { tracing::error!("thread de preparo do idioma não iniciou: {e}"); }
+}
+
+/// Troca o idioma falado durante a reunião (janela principal e flutuante).
+#[tauri::command]
+async fn set_language(app: AppHandle, lang: Lang) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let slot = lock(&st.slot);
+        let Slot::Running(run) = &*slot else { return Err("nenhuma reunião em andamento".to_string()) };
+        let mut ls = lock(&run.lang);
+        let step = ls.request(lang);
+        tracing::info!(lang = lang.code(), ?step, "pedido de troca de idioma");
+        match step {
+            Step::Nothing => {}
+            Step::Stay(l) => emit_language(&app, l, LangStatus::Active, None),
+            Step::Switch(l) => switch_now(&app, run, &mut ls, l),
+            Step::Wait(l) => emit_language(&app, l, LangStatus::Preparing, None),
+            Step::Prepare(l) => {
+                emit_language(&app, l, LangStatus::Preparing, None);
+                spawn_prepare(app.clone(), run.id.clone(), run.lang.clone(), l);
+            }
+        }
+        Ok(())
+    }).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -534,7 +685,8 @@ pub fn run() {
             if let Some(guard) = init_logs(&local) { app.manage(guard); }
             tracing::info!(dados = %root.display(), locais = %local.display(), "pastas do app");
             let config = Config::load(&root.join("config.json"));
-            app.manage(AppState { config, slot: Mutex::new(Slot::Idle), models: Mutex::new(None) });
+            app.manage(AppState { config, slot: Mutex::new(Slot::Idle), pairs: Mutex::new(HashMap::new()),
+                                 speaker: Mutex::new(None), ensuring: Mutex::new(()) });
             match recover_unfinished(&root.join("sessions")) {
                 Ok(done) if !done.is_empty() => tracing::info!("{} sessão(ões) recuperada(s)", done.len()),
                 Ok(_) => {}
@@ -560,7 +712,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             ensure_models, start_session, stop_session, list_sessions,
-            rename_voice, list_voices, rename_saved_voice, delete_voice, delete_all_voices
+            rename_voice, list_voices, rename_saved_voice, delete_voice, delete_all_voices, set_language
         ])
         .build(tauri::generate_context!())
         .expect("erro ao iniciar o gow-meet")
@@ -571,7 +723,7 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{read_sessions, voices_locked, wipe_library, Slot, Throttle, UiEvent};
+    use super::{read_sessions, same_session, serialized, voices_locked, wipe_library, LangStatus, Slot, Throttle, UiEvent};
     use gow_meet_core::lang::Lang;
     use gow_meet_core::session::{Line, Meta, Speaker, SpeakerSource};
     use std::time::{Duration, Instant};
@@ -599,6 +751,34 @@ mod tests {
             translation: None, translation_error: false };
         let v = serde_json::to_value(UiEvent::Final { line: mic }).unwrap();
         assert!(v["line"]["speaker"].get("voice").is_none());
+        let v = serde_json::to_value(UiEvent::Language { lang: Lang::Pt, status: LangStatus::Preparing, progress: Some(0.5) }).unwrap();
+        assert_eq!(v, serde_json::json!({"kind": "language", "lang": "pt", "status": "preparing", "progress": 0.5}));
+        let v = serde_json::to_value(UiEvent::Language { lang: Lang::En, status: LangStatus::Active, progress: None }).unwrap();
+        assert_eq!(v, serde_json::json!({"kind": "language", "lang": "en", "status": "active"}));
+        let v = serde_json::to_value(UiEvent::Partial { id: "s0".into(), speaker: Speaker::system(), t0: 0,
+            text: "Olá".into(), translation: None, lang: Lang::Pt }).unwrap();
+        assert_eq!(v["lang"], "pt");
+    }
+
+    #[test]
+    fn ensure_is_serialized() {
+        let st = std::sync::Arc::new(std::sync::Mutex::new(()));
+        let inside = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hs: Vec<_> = (0..4).map(|_| {
+            let (st, inside) = (st.clone(), inside.clone());
+            std::thread::spawn(move || serialized(&st, || {
+                assert_eq!(inside.fetch_add(1, std::sync::atomic::Ordering::SeqCst), 0);
+                std::thread::sleep(Duration::from_millis(20));
+                inside.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            }))
+        }).collect();
+        for h in hs { h.join().unwrap(); }
+    }
+
+    #[test]
+    fn prepare_for_ended_session_is_ignored() {
+        assert!(same_session(&Slot::Idle, "a").is_none());
+        assert!(same_session(&Slot::Stopping, "a").is_none());
     }
 
     /// O `PathResolver` do Tauri usa `dirs::data_dir` (root) e `dirs::data_local_dir`

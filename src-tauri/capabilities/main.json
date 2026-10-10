@@ -14,6 +14,7 @@
     "allow-rename-saved-voice",
     "allow-delete-voice",
     "allow-delete-all-voices",
+    "allow-set-language",
     { "identifier": "opener:allow-open-url", "allow": [{ "url": "x-apple.systempreferences:*" }] },
     { "identifier": "opener:allow-open-path", "allow": [{ "path": "$DATA/gow-meet/**" }] }
   ]

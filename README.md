@@ -46,6 +46,11 @@ cargo run --release -p gow-meet-cli -- entrada.wav \
   --opus <pasta-de-modelos>/opus-mt-en-pt \
   --prefix '>>pob<<'
 
+# reunião em português (tradução para o inglês, sem prefixo)
+cargo run --release -p gow-meet-cli -- entrada.wav --lang pt \
+  --whisper <pasta-de-modelos>/whisper-small/ggml-small-q5_1.bin \
+  --opus <pasta-de-modelos>/opus-mt-pt-en
+
 # ao vivo: áudio do sistema + microfone (Ctrl+C encerra)
 cargo run --release -p gow-meet-cli -- --live \
   --whisper <...>.bin --opus <pasta-opus> --prefix '>>pob<<'
@@ -90,15 +95,17 @@ Uma reunião interrompida (queda do app) é fechada automaticamente na próxima 
 
 ### config.json
 
-Opcional; chaves ausentes usam o padrão.
+Opcional; chaves ausentes usam o padrão. O idioma falado é escolhido na janela principal
+antes de iniciar e pode ser trocado durante a reunião (janela principal ou flutuante).
 
 | Chave | Padrão | Descrição |
 | --- | --- | --- |
-| `source_lang` | `"en"` | Idioma falado na reunião |
-| `target_lang` | `"pt"` | Idioma da tradução |
-| `whisper_model` | `"whisper-small-en"` | Modelo de transcrição (`whisper-small-en` ou `whisper-turbo`) |
-| `opus_model` | `"opus-mt-en-pt"` | Modelo de tradução |
-| `opus_prefix` | `">>pob<<"` | Prefixo de idioma de destino do Opus-MT (português do Brasil) |
+| `whisper_model` | `"whisper-small-en"` | Modelo de transcrição para reuniões em inglês (`whisper-small-en` ou `whisper-turbo`) |
+| `opus_model` | `"opus-mt-en-pt"` | Modelo de tradução inglês → português |
+| `opus_prefix` | `">>pob<<"` | Prefixo de idioma de destino do Opus-MT en→pt (português do Brasil) |
+| `whisper_model_pt` | `"whisper-small"` | Modelo de transcrição para reuniões em português |
+| `opus_model_pt` | `"opus-mt-pt-en"` | Modelo de tradução português → inglês |
+| `opus_prefix_pt` | nenhum | Prefixo de idioma de destino do Opus-MT pt→en |
 | `models_base_url` | `"https://huggingface.co"` | De onde baixar os modelos (ex.: um espelho interno) |
 | `speaker_model` | `"wespeaker-ecapa512-lm"` | Modelo de impressão de voz (quem falou) |
 | `speaker_library_threshold` | `0.70` | Semelhança mínima para reconhecer uma voz guardada |
