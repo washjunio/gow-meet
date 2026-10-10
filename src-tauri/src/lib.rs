@@ -12,7 +12,7 @@ use gow_meet_core::speaker::TractEmbedder;
 use gow_meet_core::tracker::SpeakerTracker;
 use gow_meet_core::translate::Ct2Translator;
 use gow_meet_core::voices::{VoiceLibrary, VoiceSummary, VOICES_FILE};
-use language::{LangState, Step};
+use language::{LangState, ProgressTo, Shown, Step};
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -188,16 +188,28 @@ fn serialized<T>(lock_: &Mutex<()>, f: impl FnOnce() -> T) -> T {
 /// Garante (baixa e confere o hash, uma vez por execução do app) os modelos de `lang`.
 fn ensure_pair(app: &AppHandle, st: &AppState, lang: Lang, on_progress: &mut dyn FnMut(&str, u64, Option<u64>))
     -> Result<PairPaths, String> {
-    serialized(&st.ensuring, || {
-        if let Some(p) = lock(&st.pairs).get(&lang) { return Ok(p.clone()); }
+    cached_or_serialized(&st.pairs, &st.ensuring, lang, || {
         let pair = st.config.pair(lang);
         let whisper_dir = ensure_one(app, &st.config, &pair.whisper, on_progress)?;
         let file = models::manifest().remove(&pair.whisper).and_then(|s| s.files.into_iter().next())
             .ok_or(format!("modelo {} fora do manifesto", pair.whisper))?.name;
         let opus_dir = ensure_one(app, &st.config, &pair.opus, on_progress)?;
-        let paths = PairPaths { whisper: whisper_dir.join(file), opus_dir };
-        lock(&st.pairs).insert(lang, paths.clone());
-        Ok(paths)
+        Ok(PairPaths { whisper: whisper_dir.join(file), opus_dir })
+    })
+}
+
+/// Valor de `key` no cache ou, se ausente, `make` com o lock de downloads (e guarda o
+/// resultado). O cache é consultado antes do lock: um par já verificado não espera por
+/// um download do outro idioma ainda em andamento (ex.: pedido numa reunião que já acabou).
+fn cached_or_serialized<K: Eq + std::hash::Hash + Copy, V: Clone>(
+    cache: &Mutex<HashMap<K, V>>, ensuring: &Mutex<()>, key: K, make: impl FnOnce() -> Result<V, String>,
+) -> Result<V, String> {
+    if let Some(v) = lock(cache).get(&key) { return Ok(v.clone()); }
+    serialized(ensuring, || {
+        if let Some(v) = lock(cache).get(&key) { return Ok(v.clone()); }
+        let v = make()?;
+        lock(cache).insert(key, v.clone());
+        Ok(v)
     })
 }
 
@@ -225,23 +237,25 @@ fn ensure_speaker(app: &AppHandle, st: &AppState) -> Option<PathBuf> {
     path
 }
 
-/// Carrega Whisper (GPU; sem ela, processador) e Opus-MT de `lang`. Só o par inicial
-/// avisa na tela da falta de GPU; o segundo par só registra no log.
-fn load_pair(app: &AppHandle, cfg: &Config, lang: Lang, paths: &PairPaths, warn_gpu: bool)
-    -> Result<(WhisperTranscriber, Ct2Translator), String> {
-    let asr = match WhisperTranscriber::new(&paths.whisper, lang.code(), true) {
-        Ok(t) => t,
+const GPU_UNAVAILABLE: &str = "GPU indisponível: usando o processador, a tradução ficará mais lenta.";
+
+fn warn_gpu(app: &AppHandle) {
+    let _ = app.emit("gow-meet", UiEvent::Error { message: GPU_UNAVAILABLE.into() });
+}
+
+/// Carrega Whisper (GPU; sem ela, processador) e Opus-MT de `lang`. O terceiro valor diz
+/// se o Whisper caiu para o processador: quem chama avisa na tela, uma vez por reunião.
+fn load_pair(cfg: &Config, lang: Lang, paths: &PairPaths)
+    -> Result<(WhisperTranscriber, Ct2Translator, bool), String> {
+    let (asr, cpu) = match WhisperTranscriber::new(&paths.whisper, lang.code(), true) {
+        Ok(t) => (t, false),
         Err(e) => {
             tracing::warn!(lang = lang.code(), "GPU indisponível para o Whisper: {e:#}");
-            if warn_gpu {
-                let _ = app.emit("gow-meet", UiEvent::Error {
-                    message: "GPU indisponível: usando o processador, a tradução ficará mais lenta.".into() });
-            }
-            WhisperTranscriber::new(&paths.whisper, lang.code(), false).map_err(|e| format!("{e:#}"))?
+            (WhisperTranscriber::new(&paths.whisper, lang.code(), false).map_err(|e| format!("{e:#}"))?, true)
         }
     };
     let tr = Ct2Translator::new(&paths.opus_dir, cfg.pair(lang).prefix).map_err(|e| format!("{e:#}"))?;
-    Ok((asr, tr))
+    Ok((asr, tr, cpu))
 }
 
 pub const SPEAKER_UNAVAILABLE: &str =
@@ -326,7 +340,8 @@ fn build_session(app: &AppHandle, st: &AppState, title: Option<String>, lang: La
     let cfg = &st.config;
     let paths = ensure_pair(app, st, lang, &mut main_progress(app))?;
     let speaker_model = ensure_speaker(app, st);
-    let (asr, tr) = load_pair(app, cfg, lang, &paths, true)?;
+    let (asr, tr, cpu) = load_pair(cfg, lang, &paths)?;
+    if cpu { warn_gpu(app); }
     let speakers = speaker_setup(app, cfg, speaker_model.as_deref());
     let pair = cfg.pair(lang);
     let mut model_ids = vec![("asr".to_string(), pair.whisper.clone()), ("translate".to_string(), pair.opus.clone())];
@@ -360,6 +375,9 @@ fn build_session(app: &AppHandle, st: &AppState, title: Option<String>, lang: La
         if let Ok(p) = Arc::try_unwrap(pipeline) { let _ = p.finish(started_ms); }
         return Err(format!("{e:#}"));
     }
+    let mut lang_state = LangState::new(lang);
+    // O aviso de GPU do par inicial já apareceu: o segundo par não repete.
+    if cpu { lang_state.warn_gpu_once(); }
     let stop = Arc::new(AtomicBool::new(false));
     let pump = {
         let (stop, pipeline, app) = (stop.clone(), pipeline.clone(), app.clone());
@@ -392,7 +410,7 @@ fn build_session(app: &AppHandle, st: &AppState, title: Option<String>, lang: La
         }).map_err(|e| e.to_string())?
     };
     Ok((Running { pipeline, mic, sys, stop, pump, started: Instant::now(), started_ms,
-                  id: id.clone(), lang: Arc::new(Mutex::new(LangState::new(lang))) }, id))
+                  id: id.clone(), lang: Arc::new(Mutex::new(lang_state)) }, id))
 }
 
 /// Pré-carrega o outro idioma em segundo plano se ele já está no disco (troca instantânea).
@@ -423,22 +441,31 @@ fn spawn_prepare(app: AppHandle, session: String, state: Arc<Mutex<LangState>>, 
         let t0 = Instant::now();
         let st = app.state::<AppState>();
         let mut throttle = Throttle::new();
-        let mut on_progress = |_: &str, done: u64, total: Option<u64>| {
-            // O pré-carregamento é silencioso: só mostra progresso se o usuário pediu este idioma
-            // e a reunião não acabou.
-            if !lock(&state).shows_progress_for(lang) { return; }
-            let Some(total) = total.filter(|t| *t > 0) else { return };
-            if throttle.allow(Instant::now(), done, Some(total)) {
-                emit_language(&app, lang, LangStatus::Preparing, Some(done as f32 / total as f32));
+        let mut main = main_progress(&app);
+        let mut on_progress = |file: &str, done: u64, total: Option<u64>| {
+            // Emite com o lock do idioma: um cancelamento não passa entre a checagem e o
+            // evento (senão um "preparing" atrasado ficaria na janela flutuante).
+            let ls = lock(&state);
+            match ls.progress_to(lang) {
+                ProgressTo::Language => {
+                    let Some(total) = total.filter(|t| *t > 0) else { return };
+                    if throttle.allow(Instant::now(), done, Some(total)) {
+                        emit_language(&app, lang, LangStatus::Preparing, Some(done as f32 / total as f32));
+                    }
+                }
+                // A reunião acabou: uma reunião nova pode estar esperando por este download.
+                ProgressTo::Main => main(file, done, total),
+                ProgressTo::Nowhere => {}
             }
         };
         let loaded = ensure_pair(&app, &st, lang, &mut on_progress)
-            .and_then(|paths| load_pair(&app, &st.config, lang, &paths, false));
+            .and_then(|paths| load_pair(&st.config, lang, &paths));
         let slot = lock(&st.slot);
         let Some(run) = same_session(&slot, &session) else { return };
         let mut ls = lock(&run.lang);
         match loaded {
-            Ok((asr, tr)) => {
+            Ok((asr, tr, cpu)) => {
+                if cpu && ls.warn_gpu_once() { warn_gpu(&app); }
                 tracing::info!(lang = lang.code(), ms = t0.elapsed().as_millis() as u64, "par de idioma pronto");
                 let pair = st.config.pair(lang);
                 run.pipeline.add_models(BTreeMap::from([
@@ -469,7 +496,11 @@ async fn set_language(app: AppHandle, lang: Lang) -> Result<(), String> {
         let step = ls.request(lang);
         tracing::info!(lang = lang.code(), ?step, "pedido de troca de idioma");
         match step {
-            Step::Nothing => {}
+            // Reenvia o estado atual: um clique sempre ressincroniza as janelas.
+            Step::Nothing => match ls.shown() {
+                Shown::Active(l) => emit_language(&app, l, LangStatus::Active, None),
+                Shown::Preparing(l) => emit_language(&app, l, LangStatus::Preparing, None),
+            },
             Step::Stay(l) => emit_language(&app, l, LangStatus::Active, None),
             Step::Switch(l) => switch_now(&app, run, &mut ls, l),
             Step::Wait(l) => emit_language(&app, l, LangStatus::Preparing, None),
@@ -727,9 +758,11 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{read_sessions, same_session, serialized, voices_locked, wipe_library, LangStatus, Slot, Throttle, UiEvent};
+    use super::{cached_or_serialized, lock, read_sessions, same_session, serialized, voices_locked, wipe_library, LangStatus, Slot, Throttle, UiEvent};
     use gow_meet_core::lang::Lang;
     use gow_meet_core::session::{Line, Meta, Speaker, SpeakerSource};
+    use std::collections::HashMap;
+    use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -777,6 +810,26 @@ mod tests {
             }))
         }).collect();
         for h in hs { h.join().unwrap(); }
+    }
+
+    #[test]
+    fn cached_pair_does_not_wait_for_another_download() {
+        let cache = std::sync::Arc::new(Mutex::new(HashMap::from([(Lang::En, 1u32)])));
+        let ensuring = std::sync::Arc::new(Mutex::new(()));
+        let busy = lock(&ensuring); // download do português em andamento
+        let (tx, rx) = std::sync::mpsc::channel();
+        let h = {
+            let (cache, ensuring) = (cache.clone(), ensuring.clone());
+            std::thread::spawn(move || {
+                let _ = tx.send(cached_or_serialized(&cache, &ensuring, Lang::En, || Err("baixou de novo".into())));
+            })
+        };
+        assert_eq!(rx.recv_timeout(Duration::from_secs(2)).expect("esperou o lock"), Ok(1));
+        drop(busy);
+        h.join().unwrap();
+        // Ausente: roda com o lock e guarda.
+        assert_eq!(cached_or_serialized(&cache, &ensuring, Lang::Pt, || Ok(2)), Ok(2));
+        assert_eq!(cached_or_serialized(&cache, &ensuring, Lang::Pt, || Err("de novo".into())), Ok(2));
     }
 
     #[test]
