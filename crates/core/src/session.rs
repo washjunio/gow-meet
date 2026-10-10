@@ -17,6 +17,17 @@ impl Speaker {
     pub fn system() -> Self { Self { source: SpeakerSource::System, label: "Participante".into() } }
 }
 
+/// Entrada de `speakers.json`: rótulo atual do grupo e a voz guardada a que ele aponta.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpeakerEntry {
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice_id: Option<String>,
+}
+
+/// `speakers.json`: grupo (`"v1"`) → rótulo. Sessões da etapa 1 não têm o arquivo.
+pub type Speakers = BTreeMap<String, SpeakerEntry>;
+
 fn is_false(b: &bool) -> bool { !*b }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

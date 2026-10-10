@@ -7,7 +7,9 @@ pub mod resample;
 pub mod segmenter;
 pub mod session;
 pub mod speaker;
+pub mod tracker;
 pub mod translate;
+pub mod voices;
 pub mod wav;
 pub mod wer;
 
