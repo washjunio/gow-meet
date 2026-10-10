@@ -10,6 +10,14 @@ pub struct Config {
     pub opus_model: String,
     pub opus_prefix: Option<String>,
     pub models_base_url: String,
+    /// Modelo de impressão de voz (id do manifesto).
+    pub speaker_model: String,
+    /// Semelhança mínima (cosseno) para reconhecer uma voz guardada.
+    pub speaker_library_threshold: f32,
+    /// Semelhança mínima para juntar a fala a um grupo da reunião.
+    pub speaker_group_threshold: f32,
+    /// Falas mais curtas herdam o último falante do sistema.
+    pub speaker_min_ms: u64,
 }
 
 impl Default for Config {
@@ -22,11 +30,23 @@ impl Default for Config {
             opus_model: "opus-mt-en-pt".into(),
             opus_prefix: Some(">>pob<<".into()),
             models_base_url: gow_meet_core::models::DEFAULT_BASE_URL.into(),
+            speaker_model: gow_meet_core::speaker::DEFAULT_SPEAKER_MODEL.into(),
+            speaker_library_threshold: 0.70,
+            speaker_group_threshold: 0.65,
+            speaker_min_ms: 1_000,
         }
     }
 }
 
 impl Config {
+    pub fn tracker(&self) -> gow_meet_core::tracker::TrackerConfig {
+        gow_meet_core::tracker::TrackerConfig {
+            library_threshold: self.speaker_library_threshold,
+            group_threshold: self.speaker_group_threshold,
+            min_speech_ms: self.speaker_min_ms,
+        }
+    }
+
     /// Arquivo ausente: padrões. Arquivo inválido: aviso (sem o conteúdo) e padrões.
     pub fn load(path: &Path) -> Config {
         let bytes = match std::fs::read(path) {
@@ -70,6 +90,18 @@ mod tests {
         assert_eq!(c.models_base_url, "http://espelho.local");
         assert_eq!(c.opus_model, "opus-mt-en-pt");
         assert_eq!(c.target_lang, "pt");
+    }
+
+    #[test]
+    fn speaker_defaults_and_override() {
+        let d = tempfile::tempdir().unwrap();
+        let c = Config::load(&d.path().join("config.json"));
+        assert_eq!(c.speaker_model, "wespeaker-ecapa512-lm");
+        assert_eq!(c.tracker(), gow_meet_core::tracker::TrackerConfig::default());
+        let p = d.path().join("config.json");
+        std::fs::write(&p, r#"{"speaker_group_threshold":0.6,"speaker_min_ms":1500}"#).unwrap();
+        let c = Config::load(&p);
+        assert_eq!((c.speaker_group_threshold, c.speaker_min_ms, c.speaker_library_threshold), (0.6, 1_500, 0.70));
     }
 
     #[test]

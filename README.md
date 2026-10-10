@@ -5,6 +5,9 @@ inteiramente no computador. O gow-meet captura o áudio do sistema (o que os par
 falam) e o microfone (o que você fala), transcreve o inglês com o Whisper e traduz com o
 Opus-MT. As falas aparecem numa janela flutuante, identificadas como **Você** (microfone) e
 **Participante** (áudio do sistema), e a transcrição fica salva em Markdown ao encerrar.
+Desde a etapa 2, as falas do áudio do sistema são separadas por voz (**Participante 1**,
+**Participante 2**…); clique no rótulo na janela flutuante para dar nome a uma voz. O app
+lembra das vozes nomeadas nas próximas reuniões, neste computador.
 
 Aplicativo desktop em Tauri 2 + React. Etapa 1: macOS primeiro; Windows em seguida.
 
@@ -77,7 +80,9 @@ como "Você". Nesta etapa não há cancelamento de eco: use fones de ouvido.
 | O quê | Onde |
 | --- | --- |
 | Reuniões (`meta.json`, `lines.jsonl`, `transcript.md`) | `<dados>/sessions/<id>/` |
+| Nomes das vozes de cada reunião (`speakers.json`) | `<dados>/sessions/<id>/` |
 | Configuração | `<dados>/config.json` |
+| Vozes guardadas (`voices.json`) | `<locais>/voices.json` |
 | Modelos | `<locais>/models/<id-do-modelo>/` |
 | Logs (rotação diária, 7 arquivos) | `<locais>/logs/` |
 
@@ -95,9 +100,26 @@ Opcional; chaves ausentes usam o padrão.
 | `opus_model` | `"opus-mt-en-pt"` | Modelo de tradução |
 | `opus_prefix` | `">>pob<<"` | Prefixo de idioma de destino do Opus-MT (português do Brasil) |
 | `models_base_url` | `"https://huggingface.co"` | De onde baixar os modelos (ex.: um espelho interno) |
+| `speaker_model` | `"wespeaker-ecapa512-lm"` | Modelo de impressão de voz (quem falou) |
+| `speaker_library_threshold` | `0.70` | Semelhança mínima para reconhecer uma voz guardada |
+| `speaker_group_threshold` | `0.65` | Semelhança mínima para juntar a fala a uma voz da reunião |
+| `speaker_min_ms` | `1000` | Falas mais curtas herdam o último participante que falou |
 
 A variável de ambiente `GOW_MEET_MODELS_URL` tem precedência sobre `models_base_url`. O
 download usa os certificados e o proxy configurados no sistema.
+
+## Vozes guardadas e privacidade
+
+Ao dar nome a uma voz, o app guarda uma **impressão de voz** (um vetor numérico; não é
+áudio) em `voices.json`, só neste computador, na pasta local (fora do perfil que
+sincroniza). Impressão de voz é dado biométrico (dado pessoal sensível na LGPD): o
+consentimento das pessoas é responsabilidade da gow, por processos próprios, fora do app.
+
+- A impressão nunca vai para os arquivos da reunião, para os logs ou para a tela.
+- Na janela principal, **Vozes guardadas** lista nome, última vez vista e número de falas,
+  e permite renomear, apagar uma voz ou apagar todas (fora de reunião).
+- "Apagar todas" também apaga cópias preservadas de um `voices.json` corrompido.
+- Apagar uma voz não muda transcrições antigas: o nome fica lá como texto.
 
 ## Modelos e licenças
 

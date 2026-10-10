@@ -4,9 +4,12 @@ use config::Config;
 use gow_meet_core::asr::WhisperTranscriber;
 use gow_meet_core::capture::{AudioSource, CaptureEvent, MicSource, SourceClock, SystemSource};
 use gow_meet_core::models::{self, HttpFetch};
-use gow_meet_core::pipeline::{Pipeline, PipelineConfig, PipelineEvent, Sink};
+use gow_meet_core::pipeline::{Pipeline, PipelineConfig, PipelineEvent, Sink, SpeakerId};
 use gow_meet_core::session::{recover_unfinished, session_id, Line, Meta, SessionWriter, Speaker, SpeakerSource};
+use gow_meet_core::speaker::TractEmbedder;
+use gow_meet_core::tracker::SpeakerTracker;
 use gow_meet_core::translate::Ct2Translator;
+use gow_meet_core::voices::{VoiceLibrary, VoiceSummary, VOICES_FILE};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -74,6 +77,9 @@ enum Slot {
 struct ModelPaths {
     whisper: PathBuf,
     opus_dir: PathBuf,
+    /// Arquivo do modelo de voz; `None` se não foi possível baixá-lo (a reunião segue sem
+    /// identificar quem fala, e a próxima reunião tenta de novo).
+    speaker: Option<PathBuf>,
 }
 
 struct AppState {
@@ -97,6 +103,13 @@ fn root(app: &AppHandle) -> Result<PathBuf, String> {
 fn local_root(app: &AppHandle) -> Result<PathBuf, String> {
     app.path().local_data_dir().map(|d| d.join("gow-meet")).map_err(|e| e.to_string())
 }
+
+/// Vozes guardadas: pasta local, como os modelos (fora do perfil Roaming no Windows).
+fn voices_path(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(local_root(app)?.join(VOICES_FILE))
+}
+
+fn now_ms() -> u64 { chrono::Local::now().timestamp_millis() as u64 }
 
 /// Limita os eventos de progresso a ~4 por segundo; sempre emite o primeiro,
 /// o início de um novo arquivo (done volta a baixar) e o 100%.
@@ -138,17 +151,67 @@ fn ensure_one(app: &AppHandle, cfg: &Config, id: &str) -> Result<PathBuf, String
     Ok(dir)
 }
 
-/// Verifica/baixa os modelos uma vez por execução do app.
+/// Verifica/baixa os modelos uma vez por execução do app. O modelo de voz é opcional:
+/// sem ele a reunião segue como na etapa 1.
 fn ensure_all(app: &AppHandle, st: &AppState) -> Result<ModelPaths, String> {
     let mut cached = lock(&st.models);
-    if let Some(p) = cached.as_ref() { return Ok(p.clone()); }
-    let whisper_dir = ensure_one(app, &st.config, &st.config.whisper_model)?;
-    let spec = models::manifest().remove(&st.config.whisper_model)
-        .ok_or(format!("modelo {} fora do manifesto", st.config.whisper_model))?;
-    let opus_dir = ensure_one(app, &st.config, &st.config.opus_model)?;
-    let paths = ModelPaths { whisper: whisper_dir.join(&spec.files[0].name), opus_dir };
+    let mut paths = match cached.clone() {
+        Some(p) => p,
+        None => {
+            let whisper_dir = ensure_one(app, &st.config, &st.config.whisper_model)?;
+            let spec = models::manifest().remove(&st.config.whisper_model)
+                .ok_or(format!("modelo {} fora do manifesto", st.config.whisper_model))?;
+            let opus_dir = ensure_one(app, &st.config, &st.config.opus_model)?;
+            ModelPaths { whisper: whisper_dir.join(&spec.files[0].name), opus_dir, speaker: None }
+        }
+    };
+    if paths.speaker.is_none() { paths.speaker = ensure_speaker(app, &st.config); }
     *cached = Some(paths.clone());
     Ok(paths)
+}
+
+fn ensure_speaker(app: &AppHandle, cfg: &Config) -> Option<PathBuf> {
+    let Some(name) = models::manifest().get(&cfg.speaker_model).and_then(|s| s.files.first()).map(|f| f.name.clone()) else {
+        tracing::warn!(model = %cfg.speaker_model, "modelo de voz fora do manifesto");
+        return None;
+    };
+    ensure_one(app, cfg, &cfg.speaker_model).ok().map(|dir| dir.join(name))
+}
+
+pub const SPEAKER_UNAVAILABLE: &str =
+    "Identificação de quem fala indisponível nesta reunião: os participantes aparecem como \"Participante\".";
+pub const VOICES_CORRUPT: &str =
+    "O arquivo de vozes guardadas estava corrompido: ele foi preservado e a lista de vozes recomeça vazia.";
+
+/// Identificação de quem fala. Sem modelo, ou se ele não carrega, avisa uma vez e a
+/// reunião segue sem ela.
+fn speaker_setup(app: &AppHandle, cfg: &Config, model: Option<&Path>) -> Option<SpeakerId> {
+    let warn = |message: &str| { let _ = app.emit("gow-meet", UiEvent::Error { message: message.into() }); };
+    let embedder = match model.map(TractEmbedder::new) {
+        Some(Ok(e)) => e,
+        Some(Err(e)) => {
+            tracing::warn!("modelo de voz não carregou: {e:#}");
+            warn(SPEAKER_UNAVAILABLE);
+            return None;
+        }
+        None => {
+            warn(SPEAKER_UNAVAILABLE);
+            return None;
+        }
+    };
+    let path = match voices_path(app) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("pasta das vozes guardadas indisponível: {e}");
+            warn(SPEAKER_UNAVAILABLE);
+            return None;
+        }
+    };
+    let (library, corrupt) = VoiceLibrary::load(&path, now_ms());
+    if corrupt.is_some() { warn(VOICES_CORRUPT); }
+    tracing::info!(vozes = library.len(), "identificação de vozes ligada");
+    Some(SpeakerId { embedder: Box::new(embedder),
+                     tracker: SpeakerTracker::new(cfg.tracker(), &cfg.speaker_model, library) })
 }
 
 #[tauri::command]
@@ -201,6 +264,9 @@ fn build_session(app: &AppHandle, st: &AppState, title: Option<String>) -> Resul
         }
     };
     let tr = Ct2Translator::new(&paths.opus_dir, cfg.opus_prefix.clone()).map_err(|e| format!("{e:#}"))?;
+    let speakers = speaker_setup(app, cfg, paths.speaker.as_deref());
+    let mut model_ids = vec![("asr".to_string(), cfg.whisper_model.clone()), ("translate".to_string(), cfg.opus_model.clone())];
+    if speakers.is_some() { model_ids.push(("speaker".to_string(), cfg.speaker_model.clone())); }
     let now = chrono::Local::now();
     let id = session_id(now);
     let started_ms = now.timestamp_millis() as u64;
@@ -210,12 +276,12 @@ fn build_session(app: &AppHandle, st: &AppState, title: Option<String>) -> Resul
             .unwrap_or_else(|| format!("Reunião {}", now.format("%d/%m/%Y %H:%M"))),
         started: started_ms, ended: None,
         source_lang: cfg.source_lang.clone(), target_lang: cfg.target_lang.clone(),
-        models: [("asr".to_string(), cfg.whisper_model.clone()), ("translate".to_string(), cfg.opus_model.clone())].into(),
+        models: model_ids.into_iter().collect(),
         app_version: env!("CARGO_PKG_VERSION").into(),
     };
     let writer = SessionWriter::create(&root(app)?.join("sessions"), meta).map_err(|e| format!("{e:#}"))?;
-    let pipeline = Arc::new(Pipeline::start(PipelineConfig::default(), Box::new(asr), Box::new(tr),
-                                            writer, Arc::new(TauriSink(app.clone()))));
+    let pipeline = Arc::new(Pipeline::start_with_speakers(PipelineConfig::default(), Box::new(asr), Box::new(tr),
+                                                          speakers, writer, Arc::new(TauriSink(app.clone()))));
     let (tx, rx) = crossbeam_channel::unbounded();
     // Início da linha do tempo das fontes: antes de abri-las.
     let t0 = Instant::now();
@@ -382,6 +448,72 @@ fn list_sessions(app: AppHandle) -> Result<Vec<SessionItem>, String> {
     Ok(read_sessions(&root(&app)?.join("sessions")))
 }
 
+/// Dá nome a um grupo de voz durante a reunião (janela flutuante). O slot fica travado
+/// durante a renomeação: o encerramento espera e o pipeline não muda de dono no meio.
+#[tauri::command]
+async fn rename_voice(app: AppHandle, voice: String, name: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let slot = lock(&st.slot);
+        let Slot::Running(run) = &*slot else { return Err("nenhuma reunião em andamento".to_string()) };
+        run.pipeline.rename_voice(&voice, &name).map_err(|e| format!("{e:#}"))
+    }).await.map_err(|e| e.to_string())?
+}
+
+/// Vozes guardadas, sem impressão de voz. Só leitura: um arquivo corrompido vira erro
+/// aqui e é preservado na próxima reunião ou alteração.
+#[tauri::command]
+fn list_voices(app: AppHandle) -> Result<Vec<VoiceSummary>, String> {
+    VoiceLibrary::read_summaries(&voices_path(&app)?).map_err(|e| format!("{e:#}"))
+}
+
+/// Alterações nas vozes guardadas só fora de reunião: durante a reunião o rastreador tem a
+/// biblioteca em memória e a regravaria ao encerrar (uma voz apagada voltaria).
+fn voices_locked(slot: &Slot) -> Option<&'static str> {
+    (!matches!(slot, Slot::Idle)).then_some("Encerre a reunião para alterar as vozes guardadas.")
+}
+
+/// Carrega, altera e grava (só se houve mudança). Chamada com o slot travado.
+fn edit_library(path: &Path, f: impl FnOnce(&mut VoiceLibrary) -> anyhow::Result<()>) -> anyhow::Result<()> {
+    let (mut library, _) = VoiceLibrary::load(path, now_ms());
+    f(&mut library)?;
+    library.save()
+}
+
+/// Apaga tudo (voices.json, .tmp e cópias preservadas) e NÃO regrava: o estado final é
+/// sem voices.json.
+fn wipe_library(path: &Path) -> anyhow::Result<()> {
+    let (mut library, _) = VoiceLibrary::load(path, now_ms());
+    library.delete_all()
+}
+
+/// O slot fica travado durante a alteração: nenhuma reunião começa no meio dela.
+fn with_voices_locked(app: &AppHandle, f: impl FnOnce(&Path) -> anyhow::Result<()>) -> Result<(), String> {
+    let st = app.state::<AppState>();
+    let slot = lock(&st.slot);
+    if let Some(msg) = voices_locked(&slot) { return Err(msg.into()); }
+    f(&voices_path(app)?).map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+fn rename_saved_voice(app: AppHandle, id: String, name: String) -> Result<(), String> {
+    with_voices_locked(&app, |p| edit_library(p, |l| l.rename(&id, &name)))
+}
+
+#[tauri::command]
+fn delete_voice(app: AppHandle, id: String) -> Result<(), String> {
+    with_voices_locked(&app, |p| edit_library(p, |l| l.delete(&id)))?;
+    tracing::info!(id = %id, "voz guardada apagada");
+    Ok(())
+}
+
+#[tauri::command]
+fn delete_all_voices(app: AppHandle) -> Result<(), String> {
+    with_voices_locked(&app, wipe_library)?;
+    tracing::info!("todas as vozes guardadas apagadas");
+    Ok(())
+}
+
 fn init_logs(root: &Path) -> Option<tracing_appender::non_blocking::WorkerGuard> {
     use tracing_appender::rolling::{RollingFileAppender, Rotation};
     let appender = RollingFileAppender::builder()
@@ -426,7 +558,10 @@ pub fn run() {
                 }
             }
         })
-        .invoke_handler(tauri::generate_handler![ensure_models, start_session, stop_session, list_sessions])
+        .invoke_handler(tauri::generate_handler![
+            ensure_models, start_session, stop_session, list_sessions,
+            rename_voice, list_voices, rename_saved_voice, delete_voice, delete_all_voices
+        ])
         .build(tauri::generate_context!())
         .expect("erro ao iniciar o gow-meet")
         .run(|app, event| {
@@ -436,7 +571,7 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{read_sessions, Throttle, UiEvent};
+    use super::{read_sessions, voices_locked, wipe_library, Slot, Throttle, UiEvent};
     use gow_meet_core::session::{Line, Meta, Speaker, SpeakerSource};
     use std::time::{Duration, Instant};
 
@@ -476,6 +611,27 @@ mod tests {
         eprintln!("data_dir = {}\ndata_local_dir = {}", data.display(), local.display());
         assert_eq!(data, local);
         assert!(local.ends_with("Library/Application Support"));
+    }
+
+    #[test]
+    fn saved_voices_only_change_outside_a_meeting() {
+        assert_eq!(voices_locked(&Slot::Idle), None);
+        assert!(voices_locked(&Slot::Starting).is_some());
+        assert!(voices_locked(&Slot::Stopping).is_some());
+    }
+
+    #[test]
+    fn delete_all_leaves_no_voices_file_and_no_backups() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("voices.json");
+        std::fs::write(&p, "{ corrompido").unwrap();
+        std::fs::write(d.path().join("voices.json.corrompido-1"), "x").unwrap();
+        wipe_library(&p).unwrap();
+        let left: Vec<_> = std::fs::read_dir(d.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert!(left.is_empty(), "sobrou {left:?}");
+        // Sem arquivo nenhum também funciona e não cria nada.
+        wipe_library(&p).unwrap();
+        assert!(!p.exists());
     }
 
     fn meta(id: &str, started: u64, ended: Option<u64>) -> Meta {

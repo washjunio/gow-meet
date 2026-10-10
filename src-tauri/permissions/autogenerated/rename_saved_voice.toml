@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-rename-saved-voice"
+description = "Enables the rename_saved_voice command without any pre-configured scope."
+commands.allow = ["rename_saved_voice"]
+
+[[permission]]
+identifier = "deny-rename-saved-voice"
+description = "Denies the rename_saved_voice command without any pre-configured scope."
+commands.deny = ["rename_saved_voice"]

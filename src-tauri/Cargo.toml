@@ -20,6 +20,7 @@ tauri-build = { version = "2.7.1", features = [] }
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+anyhow = { workspace = true }
 tauri = { version = "2.12.1", features = ["macos-private-api"] }
 gow-meet-core = { path = "../crates/core" }
 crossbeam-channel = { workspace = true }

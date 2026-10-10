@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "main",
-  "description": "janela principal: comandos, eventos e abertura da transcrição e dos Ajustes do Sistema",
+  "description": "janela principal: comandos (inclusive vozes guardadas), eventos e abertura da transcrição e dos Ajustes do Sistema",
   "windows": ["main"],
   "permissions": [
     "core:default",
@@ -9,6 +9,11 @@
     "allow-start-session",
     "allow-stop-session",
     "allow-list-sessions",
+    "allow-rename-voice",
+    "allow-list-voices",
+    "allow-rename-saved-voice",
+    "allow-delete-voice",
+    "allow-delete-all-voices",
     { "identifier": "opener:allow-open-url", "allow": [{ "url": "x-apple.systempreferences:*" }] },
     { "identifier": "opener:allow-open-path", "allow": [{ "path": "$DATA/gow-meet/**" }] }
   ]

@@ -2085,6 +2085,7 @@ dependencies = [
 name = "gow-meet-app"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "chrono",
  "crossbeam-channel",
  "dirs",
