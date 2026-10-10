@@ -108,3 +108,12 @@ export function applyEvent(s: State, ev: Action): State {
 export function lastEntries(s: State, n = 3): Entry[] {
   return s.order.slice(-n).map((id) => s.byId[id]);
 }
+
+/** As últimas `n` falas, mas a fala `pinned` (a que está com o campo de nome aberto) não
+ *  sai da tela quando chegam falas novas: fica na primeira posição no lugar da mais
+ *  antiga. Ela já era a primeira quando sairia, então o campo não muda de lugar. */
+export function visibleEntries(s: State, n: number, pinned?: string | null): Entry[] {
+  const last = lastEntries(s, n);
+  if (!pinned || !s.byId[pinned] || last.some((e) => e.id === pinned)) return last;
+  return [s.byId[pinned], ...lastEntries(s, n - 1)];
+}

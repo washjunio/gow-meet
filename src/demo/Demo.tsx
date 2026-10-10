@@ -4,7 +4,7 @@
  * Carregado por import dinâmico atrás de `import.meta.env.DEV`: fica fora do build de produção.
  */
 import { MainView, type MainViewProps, type Session } from "../MainWindow";
-import { OverlayView } from "../Overlay";
+import { OverlayView, type NameEdit } from "../Overlay";
 import { applyEvent, initial, type State, type UiEvent } from "../lib/transcript";
 import type { SavedVoice } from "../SavedVoices";
 
@@ -89,8 +89,8 @@ const overlayStates: Record<string, State> = {
   "overlay-speakers": speakersEv.reduce(applyEvent, initial),
   "overlay-rename": speakersEv.reduce(applyEvent, initial),
 };
-/** Estados da flutuante que abrem com o campo de nome aberto no grupo indicado. */
-const overlayEditing: Record<string, string> = { "overlay-rename": "v2" };
+/** Estados da flutuante que abrem com o campo de nome aberto na fala indicada. */
+const overlayEditing: Record<string, NameEdit> = { "overlay-rename": { voice: "v2", entry: "s1", draft: "" } };
 
 const demoStates = [...Object.keys(mainStates), ...Object.keys(overlayStates)];
 

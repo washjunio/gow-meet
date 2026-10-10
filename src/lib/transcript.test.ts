@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { applyEvent, initial, lastEntries, permissionKind, type Action, type Line } from "./transcript";
+import { applyEvent, initial, lastEntries, permissionKind, visibleEntries, type Action, type Line } from "./transcript";
 
 const sys = { source: "system" as const, label: "Participante" };
 const line = (id: string, t0: number, text: string, translation: string | null | undefined, err = false): Line =>
@@ -133,5 +133,23 @@ describe("applyEvent", () => {
       "O microfone só entrega silêncio absoluto: verifique a permissão de Microfone do gow-meet.",
     )).toBe("mic");
     expect(permissionKind("GPU indisponível")).toBeNull();
+  });
+});
+
+describe("visibleEntries", () => {
+  const four = run(...["s0", "s1", "s2", "s3"].map((id, i) => ({ kind: "final", line: line(id, i * 1000, "Hi.", null) }) as Action));
+  it("sem fala fixada é igual a lastEntries", () => {
+    expect(visibleEntries(four, 3).map((e) => e.id)).toEqual(["s1", "s2", "s3"]);
+    expect(visibleEntries(four, 3, null).map((e) => e.id)).toEqual(["s1", "s2", "s3"]);
+  });
+  it("a fala com o campo de nome aberto continua na tela quando chegam falas novas", () => {
+    expect(visibleEntries(four, 3, "s1").map((e) => e.id)).toEqual(["s1", "s2", "s3"]);
+    const more = run(...["s0", "s1", "s2", "s3", "s4", "s5"]
+      .map((id, i) => ({ kind: "final", line: line(id, i * 1000, "Hi.", null) }) as Action));
+    expect(visibleEntries(more, 3, "s1").map((e) => e.id)).toEqual(["s1", "s4", "s5"]);
+  });
+  it("fala fixada que sumiu (descartada ou reunião nova) é ignorada", () => {
+    expect(visibleEntries(four, 3, "x9").map((e) => e.id)).toEqual(["s1", "s2", "s3"]);
+    expect(visibleEntries(initial, 3, "s1")).toEqual([]);
   });
 });
