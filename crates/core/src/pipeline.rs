@@ -1,4 +1,5 @@
 use crate::asr::{clean_transcript, Transcriber};
+use crate::lang::Lang;
 use crate::segmenter::{RmsDetector, SegmentEvent, Segmenter, SegmenterConfig};
 use crate::session::{Line, SessionWriter, Speaker, SpeakerSource, Speakers};
 use crate::speaker::SpeakerEmbedder;
@@ -6,7 +7,7 @@ use crate::tracker::SpeakerTracker;
 use crate::translate::Translator;
 use anyhow::{Context, Result};
 use crossbeam_channel::{unbounded, Receiver, Sender};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -14,7 +15,7 @@ use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum PipelineEvent {
-    Partial { id: String, speaker: Speaker, t0: u64, t1: u64, text: String, translation: Option<String> },
+    Partial { id: String, speaker: Speaker, t0: u64, t1: u64, text: String, translation: Option<String>, lang: Lang },
     Final(Line),
     Translated(Line),
     Lag { ms: u64 },
@@ -35,12 +36,14 @@ pub struct PipelineConfig {
     pub vad_threshold: f32,
     pub partial_translate_every_ms: u64,
     pub lag_warn_ms: u64,
+    /// Idioma falado no início: os modelos passados a `start` são deste idioma.
+    pub lang: Lang,
 }
 
 impl Default for PipelineConfig {
     fn default() -> Self {
         Self { segmenter: SegmenterConfig::default(), vad_threshold: 0.01,
-               partial_translate_every_ms: 1_500, lag_warn_ms: 5_000 }
+               partial_translate_every_ms: 1_500, lag_warn_ms: 5_000, lang: Lang::En }
     }
 }
 
@@ -52,6 +55,14 @@ pub struct AsrJob {
     pub end_ms: u64,
     pub audio: Vec<f32>,
     pub is_final: bool,
+    pub lang: Lang,
+}
+
+/// Fila da transcrição: falas, ou os modelos de mais um idioma (que chegam antes de
+/// qualquer fala carimbada com ele, por virem na mesma fila).
+enum AsrMsg {
+    Job(AsrJob),
+    Load { lang: Lang, asr: Box<dyn Transcriber>, tr: Box<dyn Translator> },
 }
 
 pub fn line_id(source: SpeakerSource, seq: u64) -> String {
@@ -120,8 +131,14 @@ type OpenPartials = Arc<Mutex<HashMap<String, u64>>>;
 
 enum TJob {
     Final(Line),
-    Partial { id: String, speaker: Speaker, t0: u64, t1: u64, text: String },
+    Partial { id: String, speaker: Speaker, t0: u64, t1: u64, text: String, lang: Lang },
+    /// Tradutor de mais um idioma, repassado pela thread de transcrição.
+    Load(Lang, Box<dyn Translator>),
 }
+
+/// Segmentadores e idioma corrente sob o mesmo lock: cada fala sai carimbada com o
+/// idioma que valia quando foi enviada, na ordem da fila.
+struct Feed { segmenters: HashMap<SpeakerSource, Segmenter>, lang: Lang }
 
 /// Rastreador compartilhado entre a thread de transcrição e `rename_voice`. Ordem de
 /// locks: rastreador → store → parciais abertas.
@@ -138,9 +155,9 @@ struct Identify {
 
 pub struct Pipeline {
     cfg: PipelineConfig,
-    segmenters: Mutex<HashMap<SpeakerSource, Segmenter>>,
+    feed: Mutex<Feed>,
     fed: Arc<Mutex<HashMap<SpeakerSource, u64>>>,
-    asr_tx: Option<Sender<AsrJob>>,
+    asr_tx: Option<Sender<AsrMsg>>,
     asr: Option<JoinHandle<()>>,
     tr: Option<JoinHandle<()>>,
     store: Arc<Mutex<Option<Store>>>,
@@ -163,11 +180,12 @@ impl Pipeline {
         cfg: PipelineConfig, asr: Box<dyn Transcriber>, translator: Box<dyn Translator>,
         speakers: Option<SpeakerId>, writer: SessionWriter, sink: Arc<dyn Sink>,
     ) -> Self {
-        let (asr_tx, asr_rx) = unbounded::<AsrJob>();
+        let (asr_tx, asr_rx) = unbounded::<AsrMsg>();
         let (tr_tx, tr_rx) = unbounded::<TJob>();
         let store = Arc::new(Mutex::new(Some(Store { writer, pending: vec![] })));
         let fed = Arc::new(Mutex::new(HashMap::new()));
         let open: OpenPartials = Arc::new(Mutex::new(HashMap::new()));
+        let lang = cfg.lang;
         let (identify, tracker) = match speakers {
             Some(SpeakerId { embedder, tracker }) => {
                 let shared: SharedTracker = Arc::new(Mutex::new(tracker));
@@ -181,14 +199,14 @@ impl Pipeline {
             let (store, sink, fed, warn, open) =
                 (store.clone(), sink.clone(), fed.clone(), cfg.lag_warn_ms, open.clone());
             std::thread::Builder::new().name("asr".into())
-                .spawn(move || asr_loop(asr_rx, asr, identify, tr_tx, store, sink, fed, warn, open)).expect("thread asr")
+                .spawn(move || asr_loop(asr_rx, HashMap::from([(lang, asr)]), identify, tr_tx, store, sink, fed, warn, open)).expect("thread asr")
         };
         let tr_h = {
             let (store, sink, every) = (store.clone(), sink.clone(), Duration::from_millis(cfg.partial_translate_every_ms));
             std::thread::Builder::new().name("translate".into())
-                .spawn(move || translate_loop(tr_rx, translator, store, sink, every, open)).expect("thread translate")
+                .spawn(move || translate_loop(tr_rx, HashMap::from([(lang, translator)]), store, sink, every, open)).expect("thread translate")
         };
-        Self { cfg, segmenters: Mutex::new(HashMap::new()), fed, asr_tx: Some(asr_tx),
+        Self { cfg, feed: Mutex::new(Feed { segmenters: HashMap::new(), lang }), fed, asr_tx: Some(asr_tx),
                asr: Some(asr_h), tr: Some(tr_h), store, tracker, sink }
     }
 
@@ -212,35 +230,70 @@ impl Pipeline {
     }
 
     pub fn feed(&self, source: SpeakerSource, samples: &[f32]) {
-        let events = {
-            let mut segs = self.segmenters.lock().unwrap();
-            let seg = segs.entry(source).or_insert_with(|| Segmenter::new(
-                self.cfg.segmenter.clone(), Box::new(RmsDetector { threshold: self.cfg.vad_threshold })));
-            seg.push(samples)
-        };
+        let mut feed = self.feed.lock().unwrap();
+        let lang = feed.lang;
+        let seg = feed.segmenters.entry(source).or_insert_with(|| Segmenter::new(
+            self.cfg.segmenter.clone(), Box::new(RmsDetector { threshold: self.cfg.vad_threshold })));
+        let events = seg.push(samples);
         *self.fed.lock().unwrap().entry(source).or_insert(0) += samples.len() as u64;
-        self.send(source, events);
+        // Enviado com o lock: nenhuma fala anterior a uma troca sai com o idioma novo.
+        self.send(source, lang, events);
     }
 
-    fn send(&self, source: SpeakerSource, events: Vec<SegmentEvent>) {
+    /// Idioma em que as próximas falas serão transcritas.
+    pub fn language(&self) -> Lang { self.feed.lock().unwrap().lang }
+
+    /// Entrega às threads os modelos de mais um idioma, pela própria fila: chegam antes de
+    /// qualquer fala desse idioma. Não troca o idioma (veja `set_language`).
+    pub fn add_language(&self, lang: Lang, asr: Box<dyn Transcriber>, tr: Box<dyn Translator>) {
+        if let Some(tx) = &self.asr_tx { let _ = tx.send(AsrMsg::Load { lang, asr, tr }); }
+    }
+
+    /// Troca o idioma falado: fecha as falas abertas das duas fontes no idioma antigo, e o
+    /// áudio seguinte sai no novo. `false` se já era esse o idioma. Sem `add_language` antes,
+    /// as falas do idioma novo são descartadas.
+    pub fn set_language(&self, lang: Lang) -> bool {
+        let mut feed = self.feed.lock().unwrap();
+        if feed.lang == lang { return false; }
+        let old = feed.lang;
+        let flushed: Vec<(SpeakerSource, Vec<SegmentEvent>)> =
+            feed.segmenters.iter_mut().map(|(s, seg)| (*s, seg.flush())).collect();
+        for (s, ev) in flushed { self.send(s, old, ev); }
+        feed.lang = lang;
+        tracing::info!(de = old.code(), para = lang.code(), "idioma trocado");
+        true
+    }
+
+    /// Modelos carregados depois do início (o par do outro idioma), para o `meta.json`.
+    pub fn add_models(&self, models: BTreeMap<String, String>) {
+        if let Some(s) = self.store.lock().unwrap().as_mut() {
+            if let Err(e) = s.writer.add_models(models) { tracing::warn!("meta.json não atualizado: {e:#}"); }
+        }
+    }
+
+    fn send(&self, source: SpeakerSource, lang: Lang, events: Vec<SegmentEvent>) {
         let Some(tx) = &self.asr_tx else { return };
         for ev in events {
             let job = match ev {
                 SegmentEvent::Partial { seq, start_ms, audio } => {
                     let end_ms = start_ms + audio.len() as u64 / 16;
-                    AsrJob { source, seq, start_ms, end_ms, audio, is_final: false }
+                    AsrJob { source, seq, start_ms, end_ms, audio, is_final: false, lang }
                 }
                 SegmentEvent::Final { seq, start_ms, end_ms, audio } =>
-                    AsrJob { source, seq, start_ms, end_ms, audio, is_final: true },
+                    AsrJob { source, seq, start_ms, end_ms, audio, is_final: true, lang },
             };
-            let _ = tx.send(job);
+            let _ = tx.send(AsrMsg::Job(job));
         }
     }
 
     pub fn finish(mut self, ended_ms: u64) -> Result<PathBuf> {
-        let flushed: Vec<(SpeakerSource, Vec<SegmentEvent>)> = self.segmenters.lock().unwrap()
-            .iter_mut().map(|(s, seg)| (*s, seg.flush())).collect();
-        for (s, ev) in flushed { self.send(s, ev); }
+        {
+            let mut feed = self.feed.lock().unwrap();
+            let lang = feed.lang;
+            let flushed: Vec<(SpeakerSource, Vec<SegmentEvent>)> =
+                feed.segmenters.iter_mut().map(|(s, seg)| (*s, seg.flush())).collect();
+            for (s, ev) in flushed { self.send(s, lang, ev); }
+        }
         self.asr_tx.take();
         if let Some(h) = self.asr.take() { let _ = h.join(); }
         if let Some(h) = self.tr.take() { let _ = h.join(); }
@@ -300,14 +353,22 @@ impl Identify {
 }
 
 fn asr_loop(
-    rx: Receiver<AsrJob>, mut asr: Box<dyn Transcriber>, mut identify: Option<Identify>, tr_tx: Sender<TJob>,
+    rx: Receiver<AsrMsg>, mut models: HashMap<Lang, Box<dyn Transcriber>>, mut identify: Option<Identify>, tr_tx: Sender<TJob>,
     store: Arc<Mutex<Option<Store>>>, sink: Arc<dyn Sink>,
     fed: Arc<Mutex<HashMap<SpeakerSource, u64>>>, lag_warn_ms: u64, open: OpenPartials,
 ) {
-    let mut dead = false;
     while let Ok(first) = rx.recv() {
-        let mut batch = vec![first];
-        batch.extend(rx.try_iter());
+        let mut batch = vec![];
+        for msg in std::iter::once(first).chain(rx.try_iter()) {
+            match msg {
+                // Modelos novos valem já: só falas carimbadas com esse idioma os usam.
+                AsrMsg::Load { lang, asr, tr } => {
+                    models.insert(lang, asr);
+                    let _ = tr_tx.send(TJob::Load(lang, tr));
+                }
+                AsrMsg::Job(j) => batch.push(j),
+            }
+        }
         for job in coalesce(batch) {
             let fed_ms = fed.lock().unwrap().get(&job.source).copied().unwrap_or(0) / 16;
             let lag = fed_ms.saturating_sub(job.end_ms);
@@ -320,15 +381,15 @@ fn asr_loop(
                     if o.remove(&id).is_some() { sink.emit(PipelineEvent::Dropped { id: id.clone() }); }
                 }
             };
-            // Transcritor morto: segue drenando a fila para não acumular áudio.
-            if dead {
+            // Idioma sem modelo (desligado por pânico, ou nunca carregado): segue drenando a fila.
+            let Some(asr) = models.get_mut(&job.lang) else {
                 drop_final(sink.as_ref());
                 continue;
-            }
+            };
             let raw = match guarded(|| asr.transcribe(&job.audio)) {
                 None => {
-                    dead = true;
-                    tracing::error!("pânico na transcrição; reconhecimento desligado nesta sessão");
+                    models.remove(&job.lang);
+                    tracing::error!(lang = job.lang.code(), "pânico na transcrição; esse idioma fica desligado nesta sessão");
                     sink.emit(PipelineEvent::Error(ASR_PANIC_MESSAGE.into()));
                     drop_final(sink.as_ref());
                     continue;
@@ -341,7 +402,7 @@ fn asr_loop(
                     continue;
                 }
             };
-            let Some(text) = clean_transcript(&raw, crate::lang::Lang::En) else {
+            let Some(text) = clean_transcript(&raw, job.lang) else {
                 drop_final(sink.as_ref());
                 continue;
             };
@@ -350,7 +411,7 @@ fn asr_loop(
             // Identificação morta (pânico): falas genéricas, sem herdar o último falante.
             let ident = identify.as_mut().filter(|i| job.source == SpeakerSource::System && !i.dead);
             if job.is_final {
-                let mut line = Line { id, t0: job.start_ms, t1: job.end_ms, speaker, lang: crate::lang::Lang::En, text,
+                let mut line = Line { id, t0: job.start_ms, t1: job.end_ms, speaker, lang: job.lang, text,
                                       translation: None, translation_error: false };
                 // O rastreador fica travado até o evento sair: um `rename_voice` concorrente
                 // é aplicado antes (rótulo novo aqui) ou depois (evento `Speaker` depois).
@@ -390,41 +451,48 @@ fn asr_loop(
                     let mut o = open.lock().unwrap();
                     o.insert(id.clone(), job.end_ms);
                     sink.emit(PipelineEvent::Partial { id: id.clone(), speaker: speaker.clone(),
-                        t0: job.start_ms, t1: job.end_ms, text: text.clone(), translation: None });
+                        t0: job.start_ms, t1: job.end_ms, text: text.clone(), translation: None, lang: job.lang });
                 }
-                let _ = tr_tx.send(TJob::Partial { id, speaker, t0: job.start_ms, t1: job.end_ms, text });
+                let _ = tr_tx.send(TJob::Partial { id, speaker, t0: job.start_ms, t1: job.end_ms, text, lang: job.lang });
             }
         }
     }
 }
 
+/// Traduz com o modelo do idioma da fala, isolando pânicos: o primeiro desliga a tradução
+/// desse idioma e avisa uma vez. `None`: idioma sem tradutor (desligado ou não carregado).
+fn translate_with(models: &mut HashMap<Lang, Box<dyn Translator>>, lang: Lang, text: &str, sink: &dyn Sink)
+    -> Option<Result<String>> {
+    let tr = models.get_mut(&lang)?;
+    let r = guarded(|| tr.translate(text));
+    if r.is_none() {
+        models.remove(&lang);
+        tracing::error!(lang = lang.code(), "pânico na tradução; tradução desse idioma desligada nesta sessão");
+        sink.emit(PipelineEvent::Error(TRANSLATE_PANIC_MESSAGE.into()));
+    }
+    r
+}
+
 fn translate_loop(
-    rx: Receiver<TJob>, mut tr: Box<dyn Translator>, store: Arc<Mutex<Option<Store>>>,
+    rx: Receiver<TJob>, mut models: HashMap<Lang, Box<dyn Translator>>, store: Arc<Mutex<Option<Store>>>,
     sink: Arc<dyn Sink>, every: Duration, open: OpenPartials,
 ) {
     let mut last_partial: HashMap<SpeakerSource, Instant> = HashMap::new();
-    let mut dead = false;
-    // Traduz isolando pânicos: o primeiro desliga a tradução e avisa uma vez.
-    let mut translate = |text: &str| -> Option<Result<String>> {
-        if dead { return None; }
-        let r = guarded(|| tr.translate(text));
-        if r.is_none() {
-            dead = true;
-            tracing::error!("pânico na tradução; tradução desligada nesta sessão");
-            sink.emit(PipelineEvent::Error(TRANSLATE_PANIC_MESSAGE.into()));
-        }
-        r
-    };
     while let Ok(first) = rx.recv() {
-        let mut batch = vec![first];
-        batch.extend(rx.try_iter());
+        let mut batch = vec![];
+        for job in std::iter::once(first).chain(rx.try_iter()) {
+            match job {
+                TJob::Load(lang, tr) => { models.insert(lang, tr); }
+                other => batch.push(other),
+            }
+        }
         let final_ids: HashSet<String> = batch.iter()
             .filter_map(|j| match j { TJob::Final(l) => Some(l.id.clone()), _ => None }).collect();
         let mut partials: HashMap<SpeakerSource, TJob> = HashMap::new();
         for job in batch {
             match job {
                 TJob::Final(mut line) => {
-                    match translate(&line.text) {
+                    match translate_with(&mut models, line.lang, &line.text, sink.as_ref()) {
                         Some(Ok(t)) => line.translation = Some(t),
                         Some(Err(e)) => {
                             tracing::warn!(id = %line.id, "falha na tradução: {e}");
@@ -438,18 +506,18 @@ fn translate_loop(
                 TJob::Partial { ref id, ref speaker, .. } if !final_ids.contains(id) => {
                     partials.insert(speaker.source, job);
                 }
-                TJob::Partial { .. } => {}
+                TJob::Partial { .. } | TJob::Load(..) => {}
             }
         }
         for (src, job) in partials {
             if last_partial.get(&src).is_some_and(|t| t.elapsed() < every) { continue; }
-            let TJob::Partial { id, speaker, t0, t1, text } = job else { continue };
-            if let Some(Ok(t)) = translate(&text) {
+            let TJob::Partial { id, speaker, t0, t1, text, lang } = job else { continue };
+            if let Some(Ok(t)) = translate_with(&mut models, lang, &text, sink.as_ref()) {
                 last_partial.insert(src, Instant::now());
                 // Só emite se a parcial ainda é a mais recente e a fala segue aberta.
                 let o = open.lock().unwrap();
                 if o.get(&id).is_some_and(|&latest| t1 >= latest) {
-                    sink.emit(PipelineEvent::Partial { id, speaker, t0, t1, text, translation: Some(t) });
+                    sink.emit(PipelineEvent::Partial { id, speaker, t0, t1, text, translation: Some(t), lang });
                 }
             }
         }
@@ -997,7 +1065,7 @@ mod tests {
     }
 
     fn job(source: SpeakerSource, seq: u64, is_final: bool, end_ms: u64) -> AsrJob {
-        AsrJob { source, seq, start_ms: 0, end_ms, audio: vec![], is_final }
+        AsrJob { source, seq, start_ms: 0, end_ms, audio: vec![], is_final, lang: Lang::En }
     }
 
     #[test]
@@ -1009,5 +1077,145 @@ mod tests {
         ]);
         let keys: Vec<_> = out.iter().map(|j| (j.source, j.seq, j.is_final, j.end_ms)).collect();
         assert_eq!(keys, vec![(System, 0, true, 2_500), (System, 1, false, 4_000), (Mic, 0, false, 1_000)]);
+    }
+
+    use crate::lang::Lang;
+
+    struct ToEn;
+    impl Translator for ToEn {
+        fn translate(&mut self, t: &str) -> Result<String> { Ok(format!("en: {t}")) }
+    }
+    fn spoken() -> Vec<f32> { [tone(1_500), silence(1_000)].concat() }
+    fn add_pt(p: &Pipeline) { p.add_language(Lang::Pt, Box::new(FakeAsr("Olá, equipe.")), Box::new(ToEn)); }
+    fn summary(lines: &[Line]) -> Vec<(String, Lang, String, Option<String>)> {
+        lines.iter().map(|l| (l.id.clone(), l.lang, l.text.clone(), l.translation.clone())).collect()
+    }
+
+    #[test]
+    fn audio_before_switch_stays_in_old_language() {
+        let root = tempfile::tempdir().unwrap();
+        let meta = Meta { v: 1, id: "t".into(), title: "Teste".into(), started: 0, ended: None,
+            source_lang: "en".into(), target_lang: "pt".into(), models: Default::default(),
+            app_version: "0".into() };
+        let writer = SessionWriter::create(root.path(), meta).unwrap();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let sink = Arc::new(ChanSink(Mutex::new(vec![]), tx));
+        let p = Pipeline::start(PipelineConfig::default(), Box::new(FakeAsr("Hello team.")), Box::new(Prefix),
+                                writer, sink.clone());
+        p.feed(SpeakerSource::System, &spoken());
+        add_pt(&p);
+        assert!(p.set_language(Lang::Pt));
+        assert_eq!(p.language(), Lang::Pt);
+        // Em pedaços, esperando a parcial: num envio só, ela e a final caem no mesmo lote
+        // e `coalesce` descarta a parcial.
+        for c in tone(1_500).chunks(480) { p.feed(SpeakerSource::System, c); }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(PipelineEvent::Partial { id, .. }) if id == "s1" => break,
+                Ok(_) => {}
+                Err(_) => panic!("parcial não chegou a tempo"),
+            }
+        }
+        p.feed(SpeakerSource::System, &silence(1_000));
+        let md = p.finish(10_000).unwrap();
+        let lines = replay(&md.parent().unwrap().join("lines.jsonl")).unwrap();
+        let ev = sink.0.lock().unwrap().clone();
+        assert_eq!(summary(&lines), vec![
+            ("s0".into(), Lang::En, "Hello team.".into(), Some("pt: Hello team.".into())),
+            ("s1".into(), Lang::Pt, "Olá, equipe.".into(), Some("en: Olá, equipe.".into())),
+        ]);
+        let partials: Vec<(String, Lang)> = ev.iter().filter_map(|e| match e {
+            PipelineEvent::Partial { id, lang, .. } => Some((id.clone(), *lang)), _ => None }).collect();
+        assert!(partials.contains(&("s1".into(), Lang::Pt)), "{partials:?}");
+        assert!(partials.iter().all(|(id, l)| (id == "s0") == (*l == Lang::En)), "{partials:?}");
+    }
+
+    #[test]
+    fn switch_closes_open_utterances_in_old_language() {
+        let (_d, _ev, lines) = run("Hello team.", Box::new(Prefix), |p| {
+            p.feed(SpeakerSource::System, &tone(1_500)); // fala aberta
+            add_pt(p);
+            p.set_language(Lang::Pt);
+            p.feed(SpeakerSource::System, &spoken());
+        });
+        assert_eq!(summary(&lines), vec![
+            ("s0".into(), Lang::En, "Hello team.".into(), Some("pt: Hello team.".into())),
+            ("s1".into(), Lang::Pt, "Olá, equipe.".into(), Some("en: Olá, equipe.".into())),
+        ]);
+    }
+
+    #[test]
+    fn both_sources_switch_together() {
+        let (_d, _ev, lines) = run("Hello team.", Box::new(Prefix), |p| {
+            p.feed(SpeakerSource::Mic, &spoken());
+            p.feed(SpeakerSource::System, &spoken());
+            add_pt(p);
+            p.set_language(Lang::Pt);
+            p.feed(SpeakerSource::Mic, &spoken());
+            p.feed(SpeakerSource::System, &spoken());
+        });
+        let mut got: Vec<(String, Lang)> = lines.iter().map(|l| (l.id.clone(), l.lang)).collect();
+        got.sort();
+        assert_eq!(got, vec![("m0".into(), Lang::En), ("m1".into(), Lang::Pt), ("s0".into(), Lang::En), ("s1".into(), Lang::Pt)]);
+    }
+
+    #[test]
+    fn same_language_is_a_no_op() {
+        let (_d, _ev, lines) = run("Hello team.", Box::new(Prefix), |p| {
+            p.feed(SpeakerSource::System, &tone(1_500));
+            assert!(!p.set_language(Lang::En));
+            p.feed(SpeakerSource::System, &spoken()); // mesma fala continua
+        });
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].lang, Lang::En);
+    }
+
+    #[test]
+    fn language_without_models_drops_lines() {
+        let (_d, ev, lines) = run("Hello team.", Box::new(Prefix), |p| {
+            p.set_language(Lang::Pt);
+            p.feed(SpeakerSource::System, &spoken());
+        });
+        assert!(lines.is_empty());
+        assert!(!ev.iter().any(|e| matches!(e, PipelineEvent::Final(_))));
+    }
+
+    #[test]
+    fn panic_in_one_language_keeps_the_other() {
+        let (_d, ev, lines) = run("Hello team.", Box::new(Prefix), |p| {
+            p.add_language(Lang::Pt, Box::new(PanicAsr), Box::new(ToEn));
+            p.set_language(Lang::Pt);
+            p.feed(SpeakerSource::System, &spoken());
+            p.feed(SpeakerSource::System, &spoken());
+            p.set_language(Lang::En);
+            p.feed(SpeakerSource::System, &spoken());
+        });
+        assert_eq!(lines.iter().map(|l| l.lang).collect::<Vec<_>>(), vec![Lang::En]);
+        let panics = ev.iter().filter(|e| matches!(e, PipelineEvent::Error(m) if m == ASR_PANIC_MESSAGE)).count();
+        assert_eq!(panics, 1);
+    }
+
+    #[test]
+    fn add_models_goes_to_meta() {
+        let root = tempfile::tempdir().unwrap();
+        let meta = Meta { v: 1, id: "t".into(), title: "Teste".into(), started: 0, ended: None,
+            source_lang: "en".into(), target_lang: "pt".into(), models: Default::default(), app_version: "0".into() };
+        let writer = SessionWriter::create(root.path(), meta).unwrap();
+        let p = Pipeline::start(PipelineConfig::default(), Box::new(FakeAsr("Hi.")), Box::new(Prefix), writer,
+                                Arc::new(Collect::default()));
+        p.add_models([("asr_pt".to_string(), "whisper-small".to_string())].into());
+        let md = p.finish(1).unwrap();
+        let m: Meta = serde_json::from_slice(&std::fs::read(md.parent().unwrap().join("meta.json")).unwrap()).unwrap();
+        assert_eq!(m.models.get("asr_pt").map(String::as_str), Some("whisper-small"));
+    }
+
+    #[test]
+    fn coalesce_keeps_jobs_of_each_language() {
+        use SpeakerSource::*;
+        let pt = |mut j: AsrJob| { j.lang = Lang::Pt; j };
+        let out = coalesce(vec![job(System, 0, false, 1_000), job(System, 0, true, 1_500), pt(job(System, 1, false, 2_500))]);
+        let keys: Vec<_> = out.iter().map(|j| (j.seq, j.is_final, j.lang)).collect();
+        assert_eq!(keys, vec![(0, true, Lang::En), (1, false, Lang::Pt)]);
     }
 }

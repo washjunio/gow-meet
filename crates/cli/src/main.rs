@@ -78,14 +78,15 @@ fn percentile(v: &[u64], p: f64) -> u64 {
 
 fn main() -> Result<()> {
     let a = Args::parse();
-    let cfg = PipelineConfig::default();
+    let lang = gow_meet_core::lang::Lang::from_code(&a.lang).context("--lang deve ser en ou pt")?;
+    let cfg = PipelineConfig { lang, ..PipelineConfig::default() };
     let silence_close_ms = cfg.segmenter.silence_close_ms;
-    let asr = WhisperTranscriber::new(&a.whisper, &a.lang, !a.cpu)?;
+    let asr = WhisperTranscriber::new(&a.whisper, lang.code(), !a.cpu)?;
     let tr = Ct2Translator::new(&a.opus, a.prefix.clone())?;
     let now = chrono::Local::now();
     let meta = Meta { v: 1, id: session_id(now), title: "CLI".into(), started: now.timestamp_millis() as u64,
-        ended: None, source_lang: a.lang.clone(),
-        target_lang: if a.lang == "pt" { "en".into() } else { "pt".into() }, models: Default::default(),
+        ended: None, source_lang: lang.code().into(),
+        target_lang: lang.other().code().into(), models: Default::default(),
         app_version: gow_meet_core::version().into() };
     let started = meta.started;
     let writer = SessionWriter::create(&a.out, meta)?;
