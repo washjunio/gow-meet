@@ -1,10 +1,12 @@
 pub mod asr;
 pub mod capture;
+pub mod fbank;
 pub mod models;
 pub mod pipeline;
 pub mod resample;
 pub mod segmenter;
 pub mod session;
+pub mod speaker;
 pub mod translate;
 pub mod wav;
 pub mod wer;
