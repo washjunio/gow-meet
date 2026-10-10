@@ -352,15 +352,31 @@ fn shutdown_on_close(app: AppHandle) {
     });
 }
 
-#[tauri::command]
-fn list_sessions(app: AppHandle) -> Result<Vec<Meta>, String> {
-    let dir = root(&app)?.join("sessions");
-    let mut out: Vec<Meta> = std::fs::read_dir(&dir).into_iter().flatten().flatten()
-        .filter_map(|e| std::fs::read(e.path().join("meta.json")).ok())
-        .filter_map(|b| serde_json::from_slice(&b).ok())
+/// Item da lista de reuniões: o `meta.json` mais o caminho do `transcript.md`, quando
+/// ele já existe (sessão encerrada), para a janela principal abri-lo.
+#[derive(Debug, Serialize)]
+struct SessionItem {
+    #[serde(flatten)]
+    meta: Meta,
+    transcript: Option<String>,
+}
+
+fn read_sessions(dir: &Path) -> Vec<SessionItem> {
+    let mut out: Vec<SessionItem> = std::fs::read_dir(dir).into_iter().flatten().flatten()
+        .filter_map(|e| {
+            let meta: Meta = serde_json::from_slice(&std::fs::read(e.path().join("meta.json")).ok()?).ok()?;
+            let md = e.path().join("transcript.md");
+            let transcript = md.is_file().then(|| md.to_string_lossy().into_owned());
+            Some(SessionItem { meta, transcript })
+        })
         .collect();
-    out.sort_by(|a, b| b.started.cmp(&a.started));
-    Ok(out)
+    out.sort_by(|a, b| b.meta.started.cmp(&a.meta.started));
+    out
+}
+
+#[tauri::command]
+fn list_sessions(app: AppHandle) -> Result<Vec<SessionItem>, String> {
+    Ok(read_sessions(&root(&app)?.join("sessions")))
 }
 
 fn init_logs(root: &Path) -> Option<tracing_appender::non_blocking::WorkerGuard> {
@@ -417,8 +433,8 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{Throttle, UiEvent};
-    use gow_meet_core::session::{Line, Speaker, SpeakerSource};
+    use super::{read_sessions, Throttle, UiEvent};
+    use gow_meet_core::session::{Line, Meta, Speaker, SpeakerSource};
     use std::time::{Duration, Instant};
 
     #[test]
@@ -447,6 +463,34 @@ mod tests {
         eprintln!("data_dir = {}\ndata_local_dir = {}", data.display(), local.display());
         assert_eq!(data, local);
         assert!(local.ends_with("Library/Application Support"));
+    }
+
+    fn meta(id: &str, started: u64, ended: Option<u64>) -> Meta {
+        Meta { v: 1, id: id.into(), title: format!("T {id}"), started, ended,
+            source_lang: "en".into(), target_lang: "pt".into(), models: Default::default(),
+            app_version: "0".into() }
+    }
+
+    #[test]
+    fn list_sessions_includes_transcript_path_when_present() {
+        let root = tempfile::tempdir().unwrap();
+        for (m, md) in [(meta("a", 1, Some(2)), true), (meta("b", 5, None), false)] {
+            let dir = root.path().join(&m.id);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("meta.json"), serde_json::to_vec(&m).unwrap()).unwrap();
+            if md { std::fs::write(dir.join("transcript.md"), "# T").unwrap(); }
+        }
+        std::fs::create_dir_all(root.path().join("lixo")).unwrap();
+        let items = read_sessions(root.path());
+        assert_eq!(items.len(), 2);
+        let v = serde_json::to_value(&items).unwrap();
+        assert_eq!(v[0]["id"], "b");
+        assert_eq!(v[0]["ended"], serde_json::Value::Null);
+        assert_eq!(v[0]["transcript"], serde_json::Value::Null);
+        assert_eq!(v[1]["id"], "a");
+        assert_eq!(v[1]["title"], "T a");
+        let md = root.path().join("a").join("transcript.md");
+        assert_eq!(v[1]["transcript"], md.to_string_lossy().as_ref());
     }
 
     #[test]
