@@ -3,12 +3,18 @@
 //! GOW_MEET_SPEAKER_MODEL=$PWD/target/voice-models/voxceleb_ECAPA512_LM.onnx \
 //! GOW_MEET_VOICES=$PWD/target/voice-fixtures \
 //!   cargo test -p gow-meet-core --release --test speaker_say -- --ignored --nocapture
+use anyhow::Result;
+use gow_meet_core::asr::Transcriber;
+use gow_meet_core::pipeline::{Pipeline, PipelineConfig, PipelineEvent, Sink, SpeakerId};
+use gow_meet_core::session::{Meta, SessionWriter, SpeakerSource};
 use gow_meet_core::speaker::{cosine, normalize, SpeakerEmbedder, TractEmbedder};
 use gow_meet_core::tracker::{SpeakerTracker, TrackerConfig};
+use gow_meet_core::translate::Translator;
 use gow_meet_core::voices::{VoiceLibrary, VOICES_FILE};
 use gow_meet_core::wav::read_wav_16k_mono;
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 /// (voz, índice da frase) → áudio. Arquivos `<Voz>_<i>.wav`.
@@ -103,5 +109,82 @@ fn each_say_voice_gets_its_own_group_and_is_recognized_next_time() {
         if &a.label != voice { wrong += 1; eprintln!("{voice} → {}", a.label); }
     }
     eprintln!("reunião 2: {wrong}/{} erradas", all.len());
+    assert_eq!(wrong, 0);
+}
+
+struct FixedAsr;
+impl Transcriber for FixedAsr {
+    fn transcribe(&mut self, _a: &[f32]) -> Result<String> { Ok("Sentence.".into()) }
+}
+struct Echo;
+impl Translator for Echo {
+    fn translate(&mut self, t: &str) -> Result<String> { Ok(t.into()) }
+}
+#[derive(Default)]
+struct Finals(Mutex<Vec<(String, Option<String>)>>);
+impl Sink for Finals {
+    fn emit(&self, ev: PipelineEvent) {
+        if let PipelineEvent::Final(l) = ev { self.0.lock().unwrap().push((l.speaker.label, l.speaker.voice)); }
+    }
+}
+
+/// Uma reunião pelo pipeline: falas alternadas com 1,5 s de silêncio, em pedaços de 100 ms.
+/// Com `names`, dá a cada grupo o nome da voz que mais apareceu nele antes de encerrar.
+fn run_meeting(model: &Path, lib_path: &Path, order: &[(String, &Vec<f32>)], names: bool) -> Vec<(String, Option<String>)> {
+    let (library, _) = VoiceLibrary::load(lib_path, 1);
+    let sid = SpeakerId { embedder: Box::new(TractEmbedder::new(model).unwrap()),
+                          tracker: SpeakerTracker::new(TrackerConfig::default(), "teste", library) };
+    let root = tempfile::tempdir().unwrap();
+    let meta = Meta { v: 1, id: "say".into(), title: "say".into(), started: 0, ended: None,
+        source_lang: "en".into(), target_lang: "pt".into(), models: Default::default(), app_version: "0".into() };
+    let sink = Arc::new(Finals::default());
+    let p = Pipeline::start_with_speakers(PipelineConfig::default(), Box::new(FixedAsr), Box::new(Echo),
+        Some(sid), SessionWriter::create(root.path(), meta).unwrap(), sink.clone());
+    let gap = vec![0.0f32; 1_500 * 16];
+    for (_, audio) in order {
+        for c in audio.chunks(1_600).chain(gap.chunks(1_600)) { p.feed(SpeakerSource::System, c); }
+    }
+    if names {
+        let deadline = Instant::now() + std::time::Duration::from_secs(60);
+        while sink.0.lock().unwrap().len() < order.len() && Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let got = sink.0.lock().unwrap().clone();
+        let mut by_group: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
+        for ((voice, _), (_, g)) in order.iter().zip(&got) {
+            *by_group.entry(g.clone().unwrap_or_default()).or_default().entry(voice.clone()).or_default() += 1;
+        }
+        for (g, counts) in by_group {
+            let name = counts.into_iter().max_by_key(|(_, n)| *n).unwrap().0;
+            p.rename_voice(&g, &name).unwrap();
+        }
+    }
+    p.finish(1).unwrap();
+    let got = sink.0.lock().unwrap().clone();
+    got
+}
+
+#[test]
+#[ignore]
+fn say_meeting_through_the_pipeline() {
+    let model = model();
+    let f = fixtures();
+    let lib_dir = tempfile::tempdir().unwrap();
+    let lib_path = lib_dir.path().join(VOICES_FILE);
+
+    let first = meeting(&f, 0..4);
+    let got = run_meeting(&model, &lib_path, &first, true);
+    assert_eq!(got.len(), first.len(), "falas fechadas ≠ falas geradas");
+    let mut groups: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for ((voice, _), (_, g)) in first.iter().zip(&got) { groups.entry(g.clone().unwrap()).or_default().insert(voice.clone()); }
+    eprintln!("pipeline, reunião 1: {groups:?}");
+    let n_voices = f.keys().map(|(v, _)| v).collect::<BTreeSet<_>>().len();
+    assert_eq!(groups.len(), n_voices);
+    assert!(groups.values().all(|s| s.len() == 1));
+
+    let second = meeting(&f, 4..8);
+    let got = run_meeting(&model, &lib_path, &second, false);
+    let wrong = second.iter().zip(&got).filter(|((voice, _), (label, _))| voice != label).count();
+    eprintln!("pipeline, reunião 2: {wrong}/{} erradas", second.len());
     assert_eq!(wrong, 0);
 }

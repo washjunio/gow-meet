@@ -27,6 +27,8 @@ pub enum UiEvent {
     Error { message: String },
     Reconnecting { source: SpeakerSource },
     Stopped { transcript: String },
+    /// Grupo de voz renomeado: as duas janelas trocam o rótulo de todas as falas dele.
+    Speaker { voice: String, label: String },
 }
 
 struct TauriSink(AppHandle);
@@ -39,6 +41,7 @@ impl Sink for TauriSink {
             PipelineEvent::Final(line) => UiEvent::Final { line },
             PipelineEvent::Translated(line) => UiEvent::Translated { line },
             PipelineEvent::Dropped { id } => UiEvent::Dropped { id },
+            PipelineEvent::Speaker { voice, label } => UiEvent::Speaker { voice, label },
             PipelineEvent::Lag { ms } => UiEvent::Lag { ms },
             PipelineEvent::Error(message) => {
                 // As mensagens do pipeline descrevem a falha, nunca o conteúdo da fala.
@@ -450,6 +453,16 @@ mod tests {
         assert_eq!(v, serde_json::json!({"kind": "dropped", "id": "s3"}));
         let v = serde_json::to_value(UiEvent::Reconnecting { source: SpeakerSource::Mic }).unwrap();
         assert_eq!(v["kind"], "reconnecting");
+        let v = serde_json::to_value(UiEvent::Speaker { voice: "v2".into(), label: "Ana".into() }).unwrap();
+        assert_eq!(v, serde_json::json!({"kind": "speaker", "voice": "v2", "label": "Ana"}));
+        let line = Line { id: "s1".into(), t0: 0, t1: 900, speaker: Speaker::tracked("v2", "Participante 2"),
+            text: "Hi.".into(), translation: None, translation_error: false };
+        let v = serde_json::to_value(UiEvent::Final { line }).unwrap();
+        assert_eq!(v["line"]["speaker"], serde_json::json!({"source": "system", "label": "Participante 2", "voice": "v2"}));
+        let mic = Line { id: "m0".into(), t0: 0, t1: 1, speaker: Speaker::mic(), text: "Oi.".into(),
+            translation: None, translation_error: false };
+        let v = serde_json::to_value(UiEvent::Final { line: mic }).unwrap();
+        assert!(v["line"]["speaker"].get("voice").is_none());
     }
 
     /// O `PathResolver` do Tauri usa `dirs::data_dir` (root) e `dirs::data_local_dir`

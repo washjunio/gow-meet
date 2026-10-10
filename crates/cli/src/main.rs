@@ -56,7 +56,7 @@ impl Sink for Term {
             PipelineEvent::Lag { ms } => eprintln!("! atraso de {ms} ms"),
             PipelineEvent::Error(e) => eprintln!("! {e}"),
             // Parcial descartada: no CLI as parciais são linhas de log, nada a limpar.
-            PipelineEvent::Dropped { .. } => {}
+            PipelineEvent::Dropped { .. } | PipelineEvent::Speaker { .. } => {}
         }
     }
 }

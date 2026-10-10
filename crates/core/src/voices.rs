@@ -44,12 +44,15 @@ struct VoicesFile {
     voices: Vec<Voice>,
 }
 
-/// Nome aparado e validado; o erro vai para a interface (sem repetir o nome).
+/// Nome aparado e validado; o erro vai para a interface (sem repetir o nome). Cada
+/// sequência de espaços ou caracteres de controle (`\n`, `\r`, `\t`…) vira um espaço:
+/// o nome vai para o `transcript.md` e não pode quebrar a linha.
 pub fn clean_name(name: &str) -> Result<String> {
-    let name = name.trim();
+    let name = name.split(|c: char| c.is_whitespace() || c.is_control())
+        .filter(|w| !w.is_empty()).collect::<Vec<_>>().join(" ");
     if name.is_empty() { bail!("o nome não pode ficar vazio"); }
     if name.chars().count() > MAX_NAME_CHARS { bail!("o nome pode ter no máximo {MAX_NAME_CHARS} caracteres"); }
-    Ok(name.to_string())
+    Ok(name)
 }
 
 #[derive(Debug)]
@@ -448,6 +451,13 @@ mod tests {
         assert!(clean_name("").is_err());
         assert!(clean_name(&"x".repeat(61)).is_err());
         assert!(clean_name(&"é".repeat(60)).is_ok());
+    }
+
+    #[test]
+    fn names_collapse_whitespace_and_control_characters() {
+        assert_eq!(clean_name(" Ana\n\tMaria\r ").unwrap(), "Ana Maria");
+        assert_eq!(clean_name("Ana \u{0}\u{7f}  Maria").unwrap(), "Ana Maria");
+        assert!(clean_name("\n\r\t ").is_err());
     }
 
     #[test]

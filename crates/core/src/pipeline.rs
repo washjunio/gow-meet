@@ -1,6 +1,8 @@
 use crate::asr::{clean_transcript, Transcriber};
 use crate::segmenter::{RmsDetector, SegmentEvent, Segmenter, SegmenterConfig};
-use crate::session::{Line, SessionWriter, Speaker, SpeakerSource};
+use crate::session::{Line, SessionWriter, Speaker, SpeakerSource, Speakers};
+use crate::speaker::SpeakerEmbedder;
+use crate::tracker::SpeakerTracker;
 use crate::translate::Translator;
 use anyhow::{Context, Result};
 use crossbeam_channel::{unbounded, Receiver, Sender};
@@ -19,6 +21,8 @@ pub enum PipelineEvent {
     Error(String),
     /// Parcial exibida cuja fala final foi descartada (vazia/marcador).
     Dropped { id: String },
+    /// Grupo de voz renomeado: todas as falas com `speaker.voice == voice` mostram `label`.
+    Speaker { voice: String, label: String },
 }
 
 pub trait Sink: Send + Sync {
@@ -73,11 +77,30 @@ pub fn coalesce(batch: Vec<AsrJob>) -> Vec<AsrJob> {
         .collect()
 }
 
+/// Identificação de quem fala no áudio do sistema (etapa 2).
+pub struct SpeakerId {
+    pub embedder: Box<dyn SpeakerEmbedder>,
+    pub tracker: SpeakerTracker,
+}
+
+/// Aviso único quando a identificação para por erro interno (pânico no modelo de voz).
+pub const SPEAKER_PANIC_MESSAGE: &str =
+    "A identificação de quem fala parou por um erro interno; as falas seguem como \"Participante\".";
+
 /// Gravação com nova tentativa: falas que falharam ficam em memória e são
 /// regravadas antes da próxima.
 struct Store { writer: SessionWriter, pending: Vec<Line> }
 
 impl Store {
+    /// `speakers.json`: os rótulos ficam na memória do writer mesmo se a gravação falhar;
+    /// a próxima mudança e o fim da sessão tentam de novo.
+    fn set_speakers(&mut self, speakers: Speakers, sink: &dyn Sink) {
+        if let Err(e) = self.writer.set_speakers(speakers) {
+            tracing::warn!("speakers.json não gravado: {e:#}");
+            sink.emit(PipelineEvent::Error("falha ao gravar os nomes das vozes desta reunião; nova tentativa na próxima mudança".into()));
+        }
+    }
+
     fn append(&mut self, line: &Line, sink: &dyn Sink) {
         self.pending.push(line.clone());
         while let Some(l) = self.pending.first() {
@@ -100,6 +123,19 @@ enum TJob {
     Partial { id: String, speaker: Speaker, t0: u64, t1: u64, text: String },
 }
 
+/// Rastreador compartilhado entre a thread de transcrição e `rename_voice`. Ordem de
+/// locks: rastreador → store → parciais abertas.
+type SharedTracker = Arc<Mutex<SpeakerTracker>>;
+
+/// O que a thread de transcrição usa para identificar quem fala.
+struct Identify {
+    embedder: Box<dyn SpeakerEmbedder>,
+    tracker: SharedTracker,
+    /// Silêncio de fechamento no fim de cada fala final: fica fora da impressão.
+    trailing_ms: u64,
+    dead: bool,
+}
+
 pub struct Pipeline {
     cfg: PipelineConfig,
     segmenters: Mutex<HashMap<SpeakerSource, Segmenter>>,
@@ -108,31 +144,71 @@ pub struct Pipeline {
     asr: Option<JoinHandle<()>>,
     tr: Option<JoinHandle<()>>,
     store: Arc<Mutex<Option<Store>>>,
+    tracker: Option<SharedTracker>,
+    sink: Arc<dyn Sink>,
 }
+
+fn now_ms() -> u64 { chrono::Utc::now().timestamp_millis() as u64 }
 
 impl Pipeline {
     pub fn start(
         cfg: PipelineConfig, asr: Box<dyn Transcriber>, translator: Box<dyn Translator>,
         writer: SessionWriter, sink: Arc<dyn Sink>,
     ) -> Self {
+        Self::start_with_speakers(cfg, asr, translator, None, writer, sink)
+    }
+
+    /// Como `start`, identificando quem fala no áudio do sistema quando `speakers` vem.
+    pub fn start_with_speakers(
+        cfg: PipelineConfig, asr: Box<dyn Transcriber>, translator: Box<dyn Translator>,
+        speakers: Option<SpeakerId>, writer: SessionWriter, sink: Arc<dyn Sink>,
+    ) -> Self {
         let (asr_tx, asr_rx) = unbounded::<AsrJob>();
         let (tr_tx, tr_rx) = unbounded::<TJob>();
         let store = Arc::new(Mutex::new(Some(Store { writer, pending: vec![] })));
         let fed = Arc::new(Mutex::new(HashMap::new()));
         let open: OpenPartials = Arc::new(Mutex::new(HashMap::new()));
+        let (identify, tracker) = match speakers {
+            Some(SpeakerId { embedder, tracker }) => {
+                let shared: SharedTracker = Arc::new(Mutex::new(tracker));
+                let id = Identify { embedder, tracker: shared.clone(),
+                                    trailing_ms: cfg.segmenter.silence_close_ms, dead: false };
+                (Some(id), Some(shared))
+            }
+            None => (None, None),
+        };
         let asr_h = {
             let (store, sink, fed, warn, open) =
                 (store.clone(), sink.clone(), fed.clone(), cfg.lag_warn_ms, open.clone());
             std::thread::Builder::new().name("asr".into())
-                .spawn(move || asr_loop(asr_rx, asr, tr_tx, store, sink, fed, warn, open)).expect("thread asr")
+                .spawn(move || asr_loop(asr_rx, asr, identify, tr_tx, store, sink, fed, warn, open)).expect("thread asr")
         };
         let tr_h = {
-            let (store, every) = (store.clone(), Duration::from_millis(cfg.partial_translate_every_ms));
+            let (store, sink, every) = (store.clone(), sink.clone(), Duration::from_millis(cfg.partial_translate_every_ms));
             std::thread::Builder::new().name("translate".into())
                 .spawn(move || translate_loop(tr_rx, translator, store, sink, every, open)).expect("thread translate")
         };
         Self { cfg, segmenters: Mutex::new(HashMap::new()), fed, asr_tx: Some(asr_tx),
-               asr: Some(asr_h), tr: Some(tr_h), store }
+               asr: Some(asr_h), tr: Some(tr_h), store, tracker, sink }
+    }
+
+    /// Dá nome ao grupo `voice` durante a reunião: biblioteca de vozes, `speakers.json` e
+    /// evento `Speaker`. Erro (sem efeito) para identificação desligada, voz inexistente
+    /// ou nome vazio.
+    pub fn rename_voice(&self, voice: &str, name: &str) -> Result<String> {
+        let tracker = self.tracker.as_ref().context("a identificação de vozes está desligada nesta reunião")?;
+        let mut t = tracker.lock().unwrap_or_else(|e| e.into_inner());
+        let a = t.rename(voice, name, now_ms())?;
+        if let Err(e) = t.save_library() {
+            tracing::warn!("voices.json não gravado: {e:#}");
+            self.sink.emit(PipelineEvent::Error(
+                "falha ao gravar as vozes guardadas; o nome vale nesta reunião e será gravado de novo ao encerrar".into()));
+        }
+        if let Some(s) = self.store.lock().unwrap().as_mut() { s.set_speakers(t.speakers(), self.sink.as_ref()); }
+        // Emitido com o rastreador travado: nenhuma fala final do grupo com o rótulo
+        // antigo sai depois deste evento.
+        self.sink.emit(PipelineEvent::Speaker { voice: a.voice, label: a.label.clone() });
+        Ok(a.label)
     }
 
     pub fn feed(&self, source: SpeakerSource, samples: &[f32]) {
@@ -171,6 +247,17 @@ impl Pipeline {
         let store = self.store.lock().unwrap().take().context("sessão já encerrada")?;
         let mut writer = store.writer;
         for l in &store.pending { writer.append(l)?; }
+        if let Some(tracker) = self.tracker.take() {
+            let mut t = tracker.lock().unwrap_or_else(|e| e.into_inner());
+            t.finish(now_ms());
+            // Só no log: a reunião acabou, não há tela para avisar; a mensagem não leva nomes.
+            if let Err(e) = t.save_library() { tracing::warn!("voices.json não gravado ao encerrar: {e:#}"); }
+            let speakers = t.speakers();
+            if !speakers.is_empty() {
+                // Falha aqui não perde os nomes: o Markdown usa os rótulos em memória.
+                if let Err(e) = writer.set_speakers(speakers) { tracing::warn!("speakers.json não gravado: {e:#}"); }
+            }
+        }
         writer.finish(ended_ms)
     }
 }
@@ -187,8 +274,33 @@ fn guarded<T>(f: impl FnOnce() -> T) -> Option<T> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).ok()
 }
 
+impl Identify {
+    /// Impressão de voz de `audio` (16 kHz) se a fala tem ao menos `min_ms`; `None` se é
+    /// curta, se o cálculo falhou ou se a identificação morreu por pânico. Só falhas de
+    /// falas finais (`is_final`) são contadas; parciais só espiam.
+    fn embed(&mut self, audio: &[f32], speech_ms: u64, is_final: bool, sink: &dyn Sink) -> Option<Vec<f32>> {
+        if self.dead { return None; }
+        let min_ms = self.tracker.lock().unwrap_or_else(|e| e.into_inner()).min_speech_ms();
+        if speech_ms < min_ms { return None; }
+        match guarded(|| self.embedder.embed(audio)) {
+            Some(Ok(e)) => Some(e),
+            Some(Err(e)) => {
+                tracing::debug!("impressão de voz falhou: {e}");
+                if is_final { self.tracker.lock().unwrap_or_else(|e| e.into_inner()).note_embed_failure(); }
+                None
+            }
+            None => {
+                self.dead = true;
+                tracing::error!("pânico no modelo de voz; identificação desligada nesta sessão");
+                sink.emit(PipelineEvent::Error(SPEAKER_PANIC_MESSAGE.into()));
+                None
+            }
+        }
+    }
+}
+
 fn asr_loop(
-    rx: Receiver<AsrJob>, mut asr: Box<dyn Transcriber>, tr_tx: Sender<TJob>,
+    rx: Receiver<AsrJob>, mut asr: Box<dyn Transcriber>, mut identify: Option<Identify>, tr_tx: Sender<TJob>,
     store: Arc<Mutex<Option<Store>>>, sink: Arc<dyn Sink>,
     fed: Arc<Mutex<HashMap<SpeakerSource, u64>>>, lag_warn_ms: u64, open: OpenPartials,
 ) {
@@ -233,18 +345,43 @@ fn asr_loop(
                 drop_final(sink.as_ref());
                 continue;
             };
-            let speaker = speaker_for(job.source);
+            let mut speaker = speaker_for(job.source);
+            // Só o áudio do sistema passa pela identificação; o microfone é sempre "Você".
+            let ident = identify.as_mut().filter(|_| job.source == SpeakerSource::System);
             if job.is_final {
-                let line = Line { id, t0: job.start_ms, t1: job.end_ms, speaker, text,
-                                  translation: None, translation_error: false };
+                let mut line = Line { id, t0: job.start_ms, t1: job.end_ms, speaker, text,
+                                      translation: None, translation_error: false };
+                // O rastreador fica travado até o evento sair: um `rename_voice` concorrente
+                // é aplicado antes (rótulo novo aqui) ou depois (evento `Speaker` depois).
+                let mut tracked = None;
+                if let Some(ident) = ident {
+                    let trailing = (ident.trailing_ms * 16) as usize;
+                    let audio = &job.audio[..job.audio.len().saturating_sub(trailing)];
+                    let speech_ms = (job.end_ms - job.start_ms).saturating_sub(ident.trailing_ms);
+                    let emb = ident.embed(audio, speech_ms, true, sink.as_ref());
+                    let mut t = ident.tracker.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(a) = t.assign(emb.as_deref(), speech_ms) {
+                        line.speaker = Speaker::tracked(&a.voice, &a.label);
+                    }
+                    tracked = Some(t);
+                }
                 if let Some(s) = store.lock().unwrap().as_mut() { s.append(&line, sink.as_ref()); }
                 {
                     let mut o = open.lock().unwrap();
                     o.remove(&line.id);
                     sink.emit(PipelineEvent::Final(line.clone()));
                 }
+                drop(tracked);
                 let _ = tr_tx.send(TJob::Final(line));
             } else {
+                // Parcial: rótulo provável, sem mudar grupos nem contar falhas; a fala final confirma.
+                if let Some(ident) = ident {
+                    let speech_ms = job.end_ms - job.start_ms;
+                    if let Some(emb) = ident.embed(&job.audio, speech_ms, false, sink.as_ref()) {
+                        let t = ident.tracker.lock().unwrap_or_else(|e| e.into_inner());
+                        if let Some(label) = t.peek(&emb) { speaker.label = label; }
+                    }
+                }
                 {
                     let mut o = open.lock().unwrap();
                     o.insert(id.clone(), job.end_ms);
@@ -604,6 +741,204 @@ mod tests {
         let t1s: Vec<u64> = ev.iter().filter_map(|e| match e {
             PipelineEvent::Partial { id, t1, .. } if id == "s0" => Some(*t1), _ => None }).collect();
         assert!(t1s.windows(2).all(|w| w[0] <= w[1]), "t1 regrediu: {t1s:?}");
+    }
+
+    // ---------- Identificação de quem fala (etapa 2) ----------
+
+    use crate::tracker::{SpeakerTracker, TrackerConfig};
+    use crate::voices::{VoiceLibrary, VOICES_FILE};
+
+    /// Fala com amplitude própria: o embedder falso distingue "pessoas" pela energia.
+    fn voice_tone(amp: f32, ms: usize) -> Vec<f32> { (0..ms * MS).map(|i| amp * (i as f32 * 0.17).sin()).collect() }
+    const QUIET: f32 = 0.1;
+    const LOUD: f32 = 0.4;
+
+    /// Impressão falsa: [1,0,0] para fala baixa, [0,1,0] para fala alta.
+    struct EnergyEmbedder;
+    impl SpeakerEmbedder for EnergyEmbedder {
+        fn embed(&mut self, audio: &[f32]) -> Result<Vec<f32>> {
+            let rms = (audio.iter().map(|s| s * s).sum::<f32>() / audio.len().max(1) as f32).sqrt();
+            Ok(if rms < 0.15 { vec![1.0, 0.0, 0.0] } else { vec![0.0, 1.0, 0.0] })
+        }
+    }
+    struct PanicEmbedder;
+    impl SpeakerEmbedder for PanicEmbedder {
+        fn embed(&mut self, _a: &[f32]) -> Result<Vec<f32>> { panic!("falha simulada no modelo de voz") }
+    }
+
+    fn speaker_id(lib_dir: &std::path::Path, embedder: Box<dyn SpeakerEmbedder>) -> SpeakerId {
+        let library = VoiceLibrary::empty(&lib_dir.join(VOICES_FILE));
+        SpeakerId { embedder, tracker: SpeakerTracker::new(TrackerConfig::default(), "fake", library) }
+    }
+
+    fn start_tracked(lib_dir: &std::path::Path, embedder: Box<dyn SpeakerEmbedder>)
+        -> (tempfile::TempDir, Pipeline, Arc<ChanSink>, Receiver<PipelineEvent>) {
+        let root = tempfile::tempdir().unwrap();
+        let meta = Meta { v: 1, id: "t".into(), title: "Teste".into(), started: 0, ended: None,
+            source_lang: "en".into(), target_lang: "pt".into(), models: Default::default(),
+            app_version: "0".into() };
+        let writer = SessionWriter::create(root.path(), meta).unwrap();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let sink = Arc::new(ChanSink(Mutex::new(vec![]), tx));
+        let p = Pipeline::start_with_speakers(PipelineConfig::default(), Box::new(FakeAsr("Hello team.")),
+            Box::new(Prefix), Some(speaker_id(lib_dir, embedder)), writer, sink.clone());
+        (root, p, sink, rx)
+    }
+
+    fn utterance(p: &Pipeline, source: SpeakerSource, amp: f32) {
+        p.feed(source, &[voice_tone(amp, 1_500), silence(1_000)].concat());
+    }
+
+    fn finals(ev: &[PipelineEvent]) -> Vec<Line> {
+        ev.iter().filter_map(|e| match e { PipelineEvent::Final(l) => Some(l.clone()), _ => None }).collect()
+    }
+
+    #[test]
+    fn system_final_already_has_voice_and_label_and_mic_stays_voce() {
+        let lib = tempfile::tempdir().unwrap();
+        let (_d, p, sink, _rx) = start_tracked(lib.path(), Box::new(EnergyEmbedder));
+        utterance(&p, SpeakerSource::System, QUIET);
+        utterance(&p, SpeakerSource::Mic, LOUD);
+        utterance(&p, SpeakerSource::System, LOUD);
+        utterance(&p, SpeakerSource::System, QUIET);
+        p.finish(10_000).unwrap();
+        let ev = sink.0.lock().unwrap().clone();
+        let got: Vec<(String, String, Option<String>)> = finals(&ev).into_iter()
+            .map(|l| (l.id, l.speaker.label, l.speaker.voice)).collect();
+        assert_eq!(got, vec![
+            ("s0".into(), "Participante 1".into(), Some("v1".into())),
+            ("m0".into(), "Você".into(), None),
+            ("s1".into(), "Participante 2".into(), Some("v2".into())),
+            ("s2".into(), "Participante 1".into(), Some("v1".into())),
+        ]);
+        // Nenhuma fala final do sistema sai como "Participante" genérico para depois mudar.
+        assert!(!ev.iter().any(|e| matches!(e, PipelineEvent::Final(l) if l.speaker.label == "Participante")));
+    }
+
+    #[test]
+    fn rename_emits_speaker_and_names_earlier_and_later_lines() {
+        let lib = tempfile::tempdir().unwrap();
+        let (_d, p, sink, rx) = start_tracked(lib.path(), Box::new(EnergyEmbedder));
+        utterance(&p, SpeakerSource::System, QUIET);
+        wait_for(&rx, |e| matches!(e, PipelineEvent::Final(l) if l.id == "s0"));
+        assert_eq!(p.rename_voice("v1", " Ana ").unwrap(), "Ana");
+        assert!(p.rename_voice("v9", "Bruno").is_err());
+        assert!(p.rename_voice("v1", "   ").is_err());
+        utterance(&p, SpeakerSource::System, QUIET);
+        let md = std::fs::read_to_string(p.finish(10_000).unwrap()).unwrap();
+        let ev = sink.0.lock().unwrap().clone();
+        let sp: Vec<_> = ev.iter().filter(|e| matches!(e, PipelineEvent::Speaker { .. })).cloned().collect();
+        assert_eq!(sp, vec![PipelineEvent::Speaker { voice: "v1".into(), label: "Ana".into() }]);
+        let f = finals(&ev);
+        assert_eq!(f[1].speaker, Speaker::tracked("v1", "Ana"));
+        // Markdown: a fala anterior à renomeação também sai com o nome.
+        assert_eq!(md.matches("] Ana:**").count(), 2, "{md}");
+        let dir = _d.path().join("t");
+        let speakers = crate::session::read_speakers(&dir);
+        assert_eq!(speakers["v1"].label, "Ana");
+        assert!(speakers["v1"].voice_id.is_some());
+        let (library, _) = VoiceLibrary::load(&lib.path().join(VOICES_FILE), 0);
+        let s = library.summaries();
+        assert_eq!((s.len(), s[0].name.as_str(), s[0].count), (1, "Ana", 2));
+    }
+
+    #[test]
+    fn named_voice_is_recognized_in_the_next_meeting() {
+        let lib = tempfile::tempdir().unwrap();
+        let (_d, p, _s, rx) = start_tracked(lib.path(), Box::new(EnergyEmbedder));
+        utterance(&p, SpeakerSource::System, LOUD);
+        wait_for(&rx, |e| matches!(e, PipelineEvent::Final(_)));
+        p.rename_voice("v1", "Bruno").unwrap();
+        p.finish(10_000).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let meta = Meta { v: 1, id: "t2".into(), title: "Teste".into(), started: 0, ended: None,
+            source_lang: "en".into(), target_lang: "pt".into(), models: Default::default(), app_version: "0".into() };
+        let (library, _) = VoiceLibrary::load(&lib.path().join(VOICES_FILE), 0);
+        let sid = SpeakerId { embedder: Box::new(EnergyEmbedder),
+                              tracker: SpeakerTracker::new(TrackerConfig::default(), "fake", library) };
+        let sink = Arc::new(Collect::default());
+        let p = Pipeline::start_with_speakers(PipelineConfig::default(), Box::new(FakeAsr("Hello again.")),
+            Box::new(Prefix), Some(sid), SessionWriter::create(root.path(), meta).unwrap(), sink.clone());
+        utterance(&p, SpeakerSource::System, QUIET);
+        utterance(&p, SpeakerSource::System, LOUD);
+        p.finish(10_000).unwrap();
+        let labels: Vec<String> = finals(&sink.0.lock().unwrap()).into_iter().map(|l| l.speaker.label).collect();
+        assert_eq!(labels, vec!["Participante 1".to_string(), "Bruno".to_string()]);
+    }
+
+    #[test]
+    fn rename_without_identification_is_an_error() {
+        let (_d, _ev, _lines) = run("Hello team.", Box::new(Prefix), |p| {
+            assert!(p.rename_voice("v1", "Ana").is_err());
+        });
+    }
+
+    #[test]
+    fn embedder_panic_emits_one_error_and_lines_stay_participante() {
+        let lib = tempfile::tempdir().unwrap();
+        let (_d, p, sink, _rx) = start_tracked(lib.path(), Box::new(PanicEmbedder));
+        utterance(&p, SpeakerSource::System, QUIET);
+        utterance(&p, SpeakerSource::System, LOUD);
+        p.finish(10_000).unwrap();
+        let ev = sink.0.lock().unwrap().clone();
+        assert_eq!(errors(&ev), vec![SPEAKER_PANIC_MESSAGE.to_string()]);
+        let f = finals(&ev);
+        assert_eq!(f.len(), 2);
+        assert!(f.iter().all(|l| l.speaker == Speaker::system()));
+    }
+
+    /// Original corrompido que não pôde ser preservado: `save` recusa. O nome vale na
+    /// reunião, a UI recebe um aviso na renomeação e o encerramento não falha.
+    #[cfg(unix)]
+    #[test]
+    fn library_save_refusal_is_not_fatal_and_keeps_the_original() {
+        use std::os::unix::fs::PermissionsExt;
+        let lib = tempfile::tempdir().unwrap();
+        let path = lib.path().join(VOICES_FILE);
+        std::fs::write(&path, "{ corrompido").unwrap();
+        std::fs::set_permissions(lib.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let (library, backup) = VoiceLibrary::load(&path, 1);
+        assert!(backup.is_none());
+        let root = tempfile::tempdir().unwrap();
+        let meta = Meta { v: 1, id: "t".into(), title: "Teste".into(), started: 0, ended: None,
+            source_lang: "en".into(), target_lang: "pt".into(), models: Default::default(), app_version: "0".into() };
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let sink = Arc::new(ChanSink(Mutex::new(vec![]), tx));
+        let sid = SpeakerId { embedder: Box::new(EnergyEmbedder),
+                              tracker: SpeakerTracker::new(TrackerConfig::default(), "fake", library) };
+        let p = Pipeline::start_with_speakers(PipelineConfig::default(), Box::new(FakeAsr("Hello team.")),
+            Box::new(Prefix), Some(sid), SessionWriter::create(root.path(), meta).unwrap(), sink.clone());
+        utterance(&p, SpeakerSource::System, QUIET);
+        wait_for(&rx, |e| matches!(e, PipelineEvent::Final(_)));
+        assert_eq!(p.rename_voice("v1", "Ana").unwrap(), "Ana");
+        let md = std::fs::read_to_string(p.finish(10_000).unwrap()).unwrap();
+        std::fs::set_permissions(lib.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(md.contains("] Ana:**"), "{md}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ corrompido");
+        let ev = sink.0.lock().unwrap().clone();
+        assert_eq!(errors(&ev).len(), 1, "{ev:?}");
+        assert!(!errors(&ev)[0].contains("Ana"));
+    }
+
+    /// Impressão que sempre falha (sem pânico).
+    struct FailEmbedder;
+    impl SpeakerEmbedder for FailEmbedder {
+        fn embed(&mut self, _a: &[f32]) -> Result<Vec<f32>> { anyhow::bail!("falha simulada") }
+    }
+
+    #[test]
+    fn partial_embed_failure_is_not_counted_only_final_is() {
+        let lib = tempfile::tempdir().unwrap();
+        let SpeakerId { embedder, tracker } = speaker_id(lib.path(), Box::new(FailEmbedder));
+        let shared: SharedTracker = Arc::new(Mutex::new(tracker));
+        let mut ident = Identify { embedder, tracker: shared.clone(), trailing_ms: 0, dead: false };
+        let sink = Collect::default();
+        let audio = voice_tone(QUIET, 1_500);
+        assert!(ident.embed(&audio, 1_500, false, &sink).is_none());
+        assert_eq!(shared.lock().unwrap().embed_failures(), 0, "parcial não conta falha");
+        assert!(ident.embed(&audio, 1_500, true, &sink).is_none());
+        assert_eq!(shared.lock().unwrap().embed_failures(), 1);
+        assert!(sink.0.lock().unwrap().is_empty());
     }
 
     fn job(source: SpeakerSource, seq: u64, is_final: bool, end_ms: u64) -> AsrJob {

@@ -110,6 +110,9 @@ impl SpeakerTracker {
     /// Conta uma falha de impressão de uma fala FINAL (parciais não chamam isto).
     pub fn note_embed_failure(&mut self) { self.embed_failures += 1; }
 
+    #[cfg(test)]
+    pub(crate) fn embed_failures(&self) -> u64 { self.embed_failures }
+
     /// Dá nome ao grupo `voice`: grava a impressão do grupo na biblioteca (voz nova ou
     /// somada à de mesmo nome) e passa a mostrar o nome. Uma voz guardada com que o grupo
     /// tinha sido reconhecido não muda. Renomear de novo um grupo já nomeado nesta reunião
