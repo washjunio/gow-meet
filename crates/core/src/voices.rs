@@ -61,7 +61,8 @@ pub struct VoiceLibrary {
     voices: Vec<Voice>,
     /// Há mudanças ainda não gravadas. `AtomicBool` para `save(&self)` poder limpá-lo.
     dirty: AtomicBool,
-    /// O arquivo inválido não pôde ser preservado: `save` recusa para não sobrescrevê-lo.
+    /// O arquivo não pôde ser lido, ou o inválido não pôde ser preservado: `save` recusa
+    /// para não sobrescrevê-lo.
     protect_original: bool,
 }
 
@@ -70,28 +71,31 @@ impl VoiceLibrary {
         Self { path: path.to_path_buf(), voices: vec![], dirty: AtomicBool::new(false), protect_original: false }
     }
 
-    /// Arquivo ausente: biblioteca vazia. Ilegível ou inválido: biblioteca vazia e o
-    /// original renomeado para `voices.json.corrompido-<now>` (devolvido), para que a
+    /// Arquivo ausente: biblioteca vazia. Inválido (não é um JSON de vozes): biblioteca vazia
+    /// e o original renomeado para `voices.json.corrompido-<now>` (devolvido), para que a
     /// próxima gravação não o sobrescreva. Se a cópia não puder ser feita, nada é devolvido
-    /// e `save` recusa gravar nesta sessão. O log não leva o conteúdo.
+    /// e `save` recusa gravar nesta sessão. Erro de leitura (antivírus, arquivo travado por
+    /// outro programa): o arquivo pode estar bom, então não é renomeado; a biblioteca fica
+    /// vazia e `save` recusa gravar nesta sessão. O log não leva o conteúdo.
     pub fn load(path: &Path, now: u64) -> (Self, Option<PathBuf>) {
-        let parsed = match fs::read(path) {
-            Ok(bytes) => serde_json::from_slice::<VoicesFile>(&bytes).map_err(|e| {
-                tracing::warn!(line = e.line(), column = e.column(), "voices.json inválido");
-            }),
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (Self::empty(path), None),
             Err(e) => {
-                tracing::warn!(kind = ?e.kind(), "voices.json ilegível");
-                Err(())
+                tracing::warn!(kind = ?e.kind(), "voices.json ilegível; biblioteca vazia e gravação bloqueada nesta sessão");
+                let mut lib = Self::empty(path);
+                lib.protect_original = true;
+                return (lib, None);
             }
         };
-        match parsed {
+        match serde_json::from_slice::<VoicesFile>(&bytes) {
             Ok(f) => {
                 let mut lib = Self::empty(path);
                 lib.voices = f.voices;
                 (lib, None)
             }
-            Err(()) => {
+            Err(e) => {
+                tracing::warn!(line = e.line(), column = e.column(), "voices.json inválido");
                 let name = path.file_name().and_then(|n| n.to_str()).unwrap_or(VOICES_FILE);
                 let backup = path.with_file_name(format!("{name}.corrompido-{now}"));
                 let mut lib = Self::empty(path);
@@ -126,11 +130,11 @@ impl VoiceLibrary {
     }
 
     /// Grava se houve mudança desde a carga/última gravação; senão não faz nada (e não cria
-    /// o arquivo). Recusa se o arquivo inválido original não pôde ser preservado.
+    /// o arquivo). Recusa se o original não pôde ser lido ou, inválido, não pôde ser preservado.
     pub fn save(&self) -> Result<()> {
         if !self.dirty.load(Ordering::Relaxed) { return Ok(()); }
         if self.protect_original {
-            bail!("o arquivo de vozes guardadas está corrompido e não pôde ser preservado; nada foi gravado");
+            bail!("o arquivo de vozes guardadas não pôde ser lido ou preservado; nada foi gravado");
         }
         if let Some(dir) = self.path.parent() { fs::create_dir_all(dir)?; }
         let file = VoicesFile { v: 1, voices: self.voices.clone() };
@@ -410,6 +414,27 @@ mod tests {
         l.save().unwrap();
         assert!(backup.exists() && path.exists());
         assert_eq!(std::fs::read_to_string(&backup).unwrap(), "{ \"v\": 1, \"voices\": [ { quebrado");
+    }
+
+    #[test]
+    fn read_error_is_not_treated_as_corrupt_and_blocks_saving() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join(VOICES_FILE);
+        // Uma pasta no lugar de voices.json: a leitura falha (não é NotFound nem JSON
+        // inválido), como um arquivo travado por antivírus no Windows.
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("dentro"), "x").unwrap();
+        let (mut l, backup) = VoiceLibrary::load(&path, 77);
+        assert!(backup.is_none(), "erro de leitura não é arquivo corrompido");
+        assert!(l.is_empty());
+        let names: Vec<String> = std::fs::read_dir(d.path()).unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        assert_eq!(names, vec![VOICES_FILE.to_string()], "nada renomeado");
+        // Nomear não grava por cima do original que não deu para ler.
+        l.add_named(M, "Ana", &[1.0, 0.0], 1, 78).unwrap();
+        assert!(l.save().is_err());
+        assert!(path.is_dir());
+        assert_eq!(std::fs::read_to_string(path.join("dentro")).unwrap(), "x");
     }
 
     #[test]
