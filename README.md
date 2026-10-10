@@ -125,6 +125,7 @@ consentimento das pessoas é responsabilidade da gow, por processos próprios, f
 
 | Modelo | Uso | Licença |
 | --- | --- | --- |
-| whisper.cpp `small.en` / `large-v3-turbo` | transcrição | MIT |
+| whisper.cpp `small.en` / `small` (multilíngue) / `large-v3-turbo` | transcrição | MIT |
 | Opus-MT en→pt (convertido para CTranslate2) | tradução | CC BY 4.0 |
+| Opus-MT pt→en (`Helsinki-NLP/opus-mt-itc-en`, convertido para CTranslate2) | tradução | Apache-2.0 |
 | WeSpeaker ECAPA-TDNN512-LM (`Wespeaker/wespeaker-ecapa-tdnn512-LM`, treinado no VoxCeleb2) | impressão de voz (quem falou) | CC BY 4.0 — © projeto WeSpeaker (wenet-e2e) |

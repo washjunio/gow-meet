@@ -46,6 +46,24 @@
       }
     ]
   },
+  "whisper-small": {
+    "files": [
+      {
+        "name": "ggml-small-q5_1.bin",
+        "path": "ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-small-q5_1.bin",
+        "sha256": "ae85e4a935d7a567bd102fe55afc16bb595bdb618e11b2fc7591bc08120411bb"
+      }
+    ]
+  },
+  "opus-mt-pt-en": {
+    "files": [
+      { "name": "model.bin", "path": "gow-solucoes/opus-mt-pt-en-ct2/resolve/131b263a082bac106f4cea302500bb3b0832c364/model.bin", "sha256": "09aec1b569ab49b31e5c4e68ce1bb53b022a1755908b9b7a72ea6be199cba4eb" },
+      { "name": "config.json", "path": "gow-solucoes/opus-mt-pt-en-ct2/resolve/131b263a082bac106f4cea302500bb3b0832c364/config.json", "sha256": "8f6496adfc930cbfecbe8281112197705c488fab47d34b4829b06d7f478909af" },
+      { "name": "shared_vocabulary.json", "path": "gow-solucoes/opus-mt-pt-en-ct2/resolve/131b263a082bac106f4cea302500bb3b0832c364/shared_vocabulary.json", "sha256": "5e3f57455fbb488ea5b51d3501b3b0307e87ee85c2b6278ab58db1de112b977f" },
+      { "name": "source.spm", "path": "gow-solucoes/opus-mt-pt-en-ct2/resolve/131b263a082bac106f4cea302500bb3b0832c364/source.spm", "sha256": "3b27ce08c2aa9d1f12b0dbc414eceaa2a72271099d4d51ff7ab86dbfa37bf812" },
+      { "name": "target.spm", "path": "gow-solucoes/opus-mt-pt-en-ct2/resolve/131b263a082bac106f4cea302500bb3b0832c364/target.spm", "sha256": "3fbd95efb5f62282640d2c2f23adbcdc3bdd0a2fab46d5f8478b485c07820653" }
+    ]
+  },
   "wespeaker-ecapa512-lm": {
     "files": [
       {
