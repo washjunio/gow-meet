@@ -357,6 +357,8 @@ fn asr_loop(
     store: Arc<Mutex<Option<Store>>>, sink: Arc<dyn Sink>,
     fed: Arc<Mutex<HashMap<SpeakerSource, u64>>>, lag_warn_ms: u64, open: OpenPartials,
 ) {
+    // Idiomas cujas falas já foram descartadas por falta de modelo (avisa uma vez cada).
+    let mut missing: HashSet<Lang> = HashSet::new();
     while let Ok(first) = rx.recv() {
         let mut batch = vec![];
         for msg in std::iter::once(first).chain(rx.try_iter()) {
@@ -383,6 +385,9 @@ fn asr_loop(
             };
             // Idioma sem modelo (desligado por pânico, ou nunca carregado): segue drenando a fila.
             let Some(asr) = models.get_mut(&job.lang) else {
+                if missing.insert(job.lang) {
+                    tracing::warn!(lang = job.lang.code(), "fala descartada: idioma sem modelo");
+                }
                 drop_final(sink.as_ref());
                 continue;
             };
@@ -478,6 +483,8 @@ fn translate_loop(
     sink: Arc<dyn Sink>, every: Duration, open: OpenPartials,
 ) {
     let mut last_partial: HashMap<SpeakerSource, Instant> = HashMap::new();
+    // Idiomas cujas falas já ficaram sem tradução por falta de tradutor (avisa uma vez cada).
+    let mut missing: HashSet<Lang> = HashSet::new();
     while let Ok(first) = rx.recv() {
         let mut batch = vec![];
         for job in std::iter::once(first).chain(rx.try_iter()) {
@@ -492,6 +499,10 @@ fn translate_loop(
         for job in batch {
             match job {
                 TJob::Final(mut line) => {
+                    // Sem tradutor desde antes (o pânico em si já é registrado em `translate_with`).
+                    if !models.contains_key(&line.lang) && missing.insert(line.lang) {
+                        tracing::warn!(lang = line.lang.code(), "tradução descartada: idioma sem tradutor");
+                    }
                     match translate_with(&mut models, line.lang, &line.text, sink.as_ref()) {
                         Some(Ok(t)) => line.translation = Some(t),
                         Some(Err(e)) => {
