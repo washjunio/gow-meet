@@ -7,6 +7,7 @@ import { IconDocument, IconHeadphones, IconMegaphone } from "./icons";
 import { formatDate, formatDuration, percent } from "./lib/format";
 import type { PermissionKind } from "./lib/transcript";
 import { resetTranscript, useGowMeet } from "./lib/useGowMeet";
+import { SavedVoices, type SavedVoice, type VoicesUi } from "./SavedVoices";
 
 /** Item de `list_sessions`: `meta.json` + caminho do `transcript.md` (quando já existe). */
 export type Session = {
@@ -32,6 +33,12 @@ const STATUS: Record<Phase, string> = {
 
 const mb = (n: number) => Math.round(n / 1e6);
 
+/** Relê as vozes guardadas; um erro (ex.: arquivo corrompido) aparece na seção. */
+const loadVoices = (set: (v: SavedVoice[]) => void, setError: (e: string | null) => void) =>
+  invoke<SavedVoice[]>("list_voices")
+    .then((v) => { set(v); setError(null); })
+    .catch((e) => setError(String(e)));
+
 export function MainWindow() {
   const state = useGowMeet();
   const [title, setTitle] = useState("");
@@ -40,7 +47,17 @@ export function MainWindow() {
   const [progress, setProgress] = useState<Record<string, Progress>>({});
   const [sessions, setSessions] = useState<Session[]>([]);
 
-  const refresh = () => invoke<Session[]>("list_sessions").then(setSessions).catch(() => {});
+  const [voices, setVoices] = useState<SavedVoice[]>([]);
+  const [voicesError, setVoicesError] = useState<string | null>(null);
+
+  const refresh = () => {
+    invoke<Session[]>("list_sessions").then(setSessions).catch(() => {});
+    loadVoices(setVoices, setVoicesError);
+  };
+  /** Ação nas vozes guardadas: o erro aparece na seção; a lista é relida sempre. */
+  const voiceAction = (cmd: string, args?: Record<string, unknown>) =>
+    invoke(cmd, args).catch((e) => setVoicesError(String(e)))
+      .finally(() => loadVoices(setVoices, setVoicesError));
   useEffect(() => {
     refresh();
     const un = listen<Progress>("models-progress", (e) =>
@@ -86,6 +103,10 @@ export function MainWindow() {
       permissions={state.permissions}
       onOpenSettings={(k) => openUrl(SETTINGS[k].url).catch((e) => setError(String(e)))}
       lastTranscript={state.transcript} sessions={sessions} onOpen={open}
+      voices={voices} voicesError={voicesError}
+      onRenameVoice={(id, name) => voiceAction("rename_saved_voice", { id, name })}
+      onDeleteVoice={(id) => voiceAction("delete_voice", { id })}
+      onDeleteAllVoices={() => voiceAction("delete_all_voices")}
     />
   );
 }
@@ -104,6 +125,13 @@ export type MainViewProps = {
   lastTranscript: string | null;
   sessions: Session[];
   onOpen: (path: string) => void;
+  voices: SavedVoice[];
+  voicesError: string | null;
+  onRenameVoice: (id: string, name: string) => void;
+  onDeleteVoice: (id: string) => void;
+  onDeleteAllVoices: () => void;
+  /** Só para o modo demo: estado inicial da seção de vozes. */
+  voicesUi?: VoicesUi;
 };
 
 /** Apresentação da janela principal, sem acesso ao backend (usada também no modo demo). */
@@ -217,6 +245,10 @@ export function MainView(p: MainViewProps) {
                 </ul>
               )}
           </section>
+
+          <SavedVoices voices={p.voices} error={p.voicesError} locked={phase !== "idle"}
+            onRename={p.onRenameVoice} onDelete={p.onDeleteVoice} onDeleteAll={p.onDeleteAllVoices}
+            initial={p.voicesUi} />
         </main>
       </div>
     </div>

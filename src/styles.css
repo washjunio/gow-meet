@@ -154,13 +154,28 @@ body { margin: 0; background: var(--preto); }
 .session-status.live { color: var(--amarelo); }
 .empty { color: var(--cinza); font-size: 14px; margin: 0; }
 
+.privacy { margin: 0 0 14px; }
+.voices { list-style: none; padding: 0; margin: 0; border-top: 1px solid var(--borda); }
+.voice {
+  display: grid; grid-template-columns: minmax(0, 1fr) 150px 70px auto; gap: 16px; align-items: center;
+  min-height: 52px; padding: 8px 4px; border-bottom: 1px solid var(--borda); font-size: 14px;
+}
+.voice-name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.voice-seen, .voice-count { color: var(--texto-2); font-size: 13px; font-variant-numeric: tabular-nums; }
+.voice-actions { display: flex; gap: 8px; justify-content: flex-end; }
+.field-small { height: 34px; font-size: 14px; padding: 0 10px; }
+.btn-danger { background: transparent; color: var(--amarelo); border-color: var(--amarelo); }
+.btn-danger:hover { background: var(--amarelo); color: var(--preto); }
+.confirm { display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--texto-2); }
+.voices-error { margin: 0 0 12px; color: var(--amarelo); font-size: 13px; }
+
 /* ---------- Janela flutuante (legendas) ---------- */
 .overlay {
   height: 100%; padding: 14px 18px 16px; overflow: hidden; display: flex; flex-direction: column;
   background: rgba(23, 23, 23, 0.92); border-radius: 12px; color: var(--branco);
   user-select: none; -webkit-user-select: none; cursor: default;
 }
-/* Nada é clicável aqui: o alvo do mouse é sempre um elemento com data-tauri-drag-region. */
+/* Tudo arrasta (data-tauri-drag-region), menos o rótulo de quem fala, que é clicável. */
 .overlay img, .overlay .dot { pointer-events: none; }
 .overlay-head { display: flex; align-items: center; gap: 12px; min-height: 22px; flex: none; }
 .overlay-symbol { width: 22px; height: 22px; display: block; }
@@ -183,6 +198,23 @@ body { margin: 0; background: var(--preto); }
   text-transform: uppercase; color: #C8C8C8; margin-bottom: 2px;
 }
 .speaker.me { color: var(--amarelo); }
+/* Rótulo clicável: mesma tipografia, sem cor por pessoa; o lápis só aparece no hover. */
+.speaker-edit {
+  display: inline-flex; align-items: center; gap: 6px; padding: 0; background: none; border: 0;
+  cursor: pointer; text-align: left;
+}
+.speaker-edit svg { opacity: 0; transition: opacity 0.12s; color: var(--texto-2); }
+.speaker-edit:hover svg, .speaker-edit:focus-visible svg { opacity: 1; }
+.speaker-edit:hover { color: var(--branco); }
+.speaker-edit:focus-visible { outline: 1px solid var(--amarelo); outline-offset: 2px; }
+.speaker-input {
+  display: block; width: 220px; max-width: 100%; height: 22px; margin-bottom: 2px; padding: 0 6px;
+  border-radius: 3px; background: var(--superficie); border: 1px solid var(--amarelo); color: var(--branco);
+  font-family: var(--titulo); font-weight: 700; font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase;
+  user-select: text; -webkit-user-select: text;
+}
+.speaker-input:focus { outline: none; }
+.speaker-input::placeholder { color: var(--cinza); }
 .translation { font-size: 17px; line-height: 1.35; color: var(--branco); }
 .original { font-size: 12px; line-height: 1.4; color: var(--cinza); margin-top: 3px; }
 .caption.partial .translation { color: #A6A6A6; }

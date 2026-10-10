@@ -1,4 +1,5 @@
-export type Speaker = { source: "mic" | "system"; label: string };
+/** `voice`: grupo de voz na reunião ("v1"…), só em falas do sistema identificadas. */
+export type Speaker = { source: "mic" | "system"; label: string; voice?: string };
 export type Line = {
   id: string; t0: number; t1: number; speaker: Speaker;
   text: string; translation?: string | null; translation_error?: boolean;
@@ -12,7 +13,9 @@ export type UiEvent =
   | { kind: "lag"; ms: number }
   | { kind: "error"; message: string }
   | { kind: "reconnecting"; source: "mic" | "system" }
-  | { kind: "stopped"; transcript: string };
+  | { kind: "stopped"; transcript: string }
+  /** Grupo de voz renomeado: todas as falas com `speaker.voice === voice` mostram `label`. */
+  | { kind: "speaker"; voice: string; label: string };
 /** `reset` é local do front-end: emitido ao iniciar uma nova sessão. */
 export type Action = UiEvent | { kind: "reset" };
 
@@ -27,9 +30,18 @@ export type State = {
   lagMs: number | null; notice: string | null; transcript: string | null;
   /** Avisos de permissão ausente: persistem até a sessão parar. */
   permissions: Partial<Record<PermissionKind, string>>;
+  /** Nomes dados nesta reunião (evento `speaker`): valem também para falas e traduções
+   *  que chegam depois com o rótulo antigo. */
+  labels: Record<string, string>;
 };
 
-export const initial: State = { order: [], byId: {}, lagMs: null, notice: null, transcript: null, permissions: {} };
+export const initial: State = {
+  order: [], byId: {}, lagMs: null, notice: null, transcript: null, permissions: {}, labels: {},
+};
+
+/** Aplica o nome dado ao grupo de voz, se houver. */
+const relabel = (sp: Speaker, labels: Record<string, string>): Speaker =>
+  sp.voice !== undefined && labels[sp.voice] !== undefined ? { ...sp, label: labels[sp.voice] } : sp;
 
 /** Reconhece avisos sobre permissão ausente de Microfone ou de Gravação de Tela e Áudio do Sistema. */
 export function permissionKind(message: string): PermissionKind | null {
@@ -45,8 +57,8 @@ function upsert(s: State, e: Entry): State {
   return { ...s, byId, order };
 }
 
-const fromLine = (l: Line, prev?: Entry): Entry => ({
-  id: l.id, speaker: l.speaker, t0: l.t0, text: l.text, final: true,
+const fromLine = (l: Line, labels: Record<string, string>, prev?: Entry): Entry => ({
+  id: l.id, speaker: relabel(l.speaker, labels), t0: l.t0, text: l.text, final: true,
   translation: l.translation ?? prev?.translation ?? null,
   translationError: !!l.translation_error,
 });
@@ -64,9 +76,9 @@ export function applyEvent(s: State, ev: Action): State {
       });
     }
     case "final":
-      return { ...upsert(s, fromLine(ev.line, s.byId[ev.line.id])), lagMs: null, notice: null };
+      return { ...upsert(s, fromLine(ev.line, s.labels, s.byId[ev.line.id])), lagMs: null, notice: null };
     case "translated":
-      return upsert(s, { ...fromLine(ev.line, s.byId[ev.line.id]), translation: ev.line.translation ?? null });
+      return upsert(s, { ...fromLine(ev.line, s.labels, s.byId[ev.line.id]), translation: ev.line.translation ?? null });
     case "dropped": {
       if (!s.byId[ev.id]) return s;
       const byId = { ...s.byId };
@@ -84,6 +96,12 @@ export function applyEvent(s: State, ev: Action): State {
       return { ...s, notice: "Reconectando áudio…" };
     case "stopped":
       return { ...s, transcript: ev.transcript, permissions: {} };
+    case "speaker": {
+      const labels = { ...s.labels, [ev.voice]: ev.label };
+      const byId: Record<string, Entry> = {};
+      for (const [id, e] of Object.entries(s.byId)) byId[id] = { ...e, speaker: relabel(e.speaker, labels) };
+      return { ...s, labels, byId };
+    }
   }
 }
 

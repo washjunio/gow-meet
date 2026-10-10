@@ -92,6 +92,38 @@ describe("applyEvent", () => {
     expect(s.permissions).toEqual({});
   });
 
+  it("evento speaker troca o rótulo de todas as falas do grupo", () => {
+    const v1 = { source: "system" as const, label: "Participante 1", voice: "v1" };
+    const v2 = { source: "system" as const, label: "Participante 2", voice: "v2" };
+    const me = { source: "mic" as const, label: "Você" };
+    const s = run(
+      { kind: "final", line: { ...line("s0", 0, "Hello.", null), speaker: v1 } },
+      { kind: "final", line: { ...line("s1", 1000, "Hi.", null), speaker: v2 } },
+      { kind: "final", line: { ...line("m0", 1500, "Hey.", null), speaker: me } },
+      { kind: "final", line: { ...line("s2", 2000, "Next topic.", null), speaker: v1 } },
+      { kind: "speaker", voice: "v1", label: "Ana" },
+    );
+    expect(s.order.map((id) => s.byId[id].speaker.label)).toEqual(["Ana", "Participante 2", "Você", "Ana"]);
+    expect(s.byId.s0.speaker).toEqual({ source: "system", label: "Ana", voice: "v1" });
+  });
+
+  it("tradução que chega depois do nome mantém o nome", () => {
+    const v1 = { source: "system" as const, label: "Participante 1", voice: "v1" };
+    const s = run(
+      { kind: "final", line: { ...line("s0", 0, "Hello.", null), speaker: v1 } },
+      { kind: "speaker", voice: "v1", label: "Ana" },
+      { kind: "translated", line: { ...line("s0", 0, "Hello.", "Olá."), speaker: v1 } },
+      { kind: "final", line: { ...line("s1", 900, "Bye.", null), speaker: v1 } },
+    );
+    expect(s.byId.s0).toMatchObject({ translation: "Olá.", speaker: { label: "Ana" } });
+    expect(s.byId.s1.speaker.label).toBe("Ana");
+  });
+
+  it("reset esquece os nomes da reunião anterior", () => {
+    const s = run({ kind: "speaker", voice: "v1", label: "Ana" }, { kind: "reset" });
+    expect(s.labels).toEqual({});
+  });
+
   it("classifica avisos de permissão", () => {
     expect(permissionKind("sem permissão de Gravação de Tela e Áudio do Sistema (x)")).toBe("screen");
     expect(permissionKind("Sem permissão para o Microfone")).toBe("mic");
