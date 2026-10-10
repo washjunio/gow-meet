@@ -19,17 +19,26 @@ pub enum Step {
 }
 
 #[derive(Debug)]
-pub struct LangState { active: Lang, wanted: Lang, ready: HashSet<Lang>, loading: HashSet<Lang> }
+pub struct LangState {
+    active: Lang,
+    wanted: Lang,
+    ready: HashSet<Lang>,
+    loading: HashSet<Lang>,
+    /// A reunião acabou: um preparo ainda em andamento não mostra mais nada.
+    closed: bool,
+}
 
 impl LangState {
     pub fn new(active: Lang) -> Self {
-        Self { active, wanted: active, ready: HashSet::from([active]), loading: HashSet::new() }
+        Self { active, wanted: active, ready: HashSet::from([active]), loading: HashSet::new(),
+               closed: false }
     }
 
     /// Idioma em que o pipeline está transcrevendo.
     pub fn active(&self) -> Lang { self.active }
 
-    /// Último idioma pedido pelo usuário.
+    /// Último idioma pedido pelo usuário (o app usa `shows_progress_for`).
+    #[cfg(test)]
     pub fn wanted(&self) -> Lang { self.wanted }
 
     /// Pré-carregamento ao iniciar, sem pedido do usuário. `false` se já está pronto ou em preparo.
@@ -57,6 +66,15 @@ impl LangState {
 
     pub fn switched(&mut self, lang: Lang) { self.active = lang; }
 
+    /// A reunião acabou: descarta a troca pendente para as janelas.
+    pub fn close(&mut self) { self.closed = true; }
+
+    /// O progresso do preparo de `lang` aparece nas janelas: só se o usuário pediu este
+    /// idioma e a reunião não acabou (senão vazaria para a reunião seguinte).
+    pub fn shows_progress_for(&self, lang: Lang) -> bool {
+        !self.closed && self.wanted == lang && self.active != lang
+    }
+
     /// Preparação falhou. `true` se era o pedido atual: o pedido volta ao idioma atual e as
     /// janelas precisam ser avisadas. Pré-carregamento que falha não avisa ninguém.
     pub fn failed(&mut self, lang: Lang) -> bool {
@@ -71,6 +89,16 @@ impl LangState {
 mod tests {
     use super::*;
     use Lang::*;
+
+    #[test]
+    fn closed_state_shows_no_progress() {
+        let mut s = LangState::new(En);
+        assert!(!s.shows_progress_for(Pt));
+        assert_eq!(s.request(Pt), Step::Prepare(Pt));
+        assert!(s.shows_progress_for(Pt));
+        s.close();
+        assert!(!s.shows_progress_for(Pt));
+    }
 
     #[test]
     fn current_language_needs_nothing() {

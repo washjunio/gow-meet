@@ -424,8 +424,9 @@ fn spawn_prepare(app: AppHandle, session: String, state: Arc<Mutex<LangState>>, 
         let st = app.state::<AppState>();
         let mut throttle = Throttle::new();
         let mut on_progress = |_: &str, done: u64, total: Option<u64>| {
-            // O pré-carregamento é silencioso: só mostra progresso se o usuário pediu este idioma.
-            if lock(&state).wanted() != lang { return; }
+            // O pré-carregamento é silencioso: só mostra progresso se o usuário pediu este idioma
+            // e a reunião não acabou.
+            if !lock(&state).shows_progress_for(lang) { return; }
             let Some(total) = total.filter(|t| *t > 0) else { return };
             if throttle.allow(Instant::now(), done, Some(total)) {
                 emit_language(&app, lang, LangStatus::Preparing, Some(done as f32 / total as f32));
@@ -525,6 +526,9 @@ fn end_session(st: &AppState) -> Result<String, EndError> {
             other => { *slot = other; return Err(EndError::NotRunning); }
         }
     };
+    // Fora do slot (ordem slot → idioma): um preparo do outro idioma ainda em andamento
+    // para de mostrar progresso, que senão apareceria na reunião seguinte.
+    lock(&run.lang).close();
     // Ordem: parar a captura, encerrar o pump, finalizar o pipeline.
     run.mic.stop();
     run.sys.stop();
