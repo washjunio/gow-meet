@@ -98,3 +98,11 @@ Opcional; chaves ausentes usam o padrão.
 
 A variável de ambiente `GOW_MEET_MODELS_URL` tem precedência sobre `models_base_url`. O
 download usa os certificados e o proxy configurados no sistema.
+
+## Modelos e licenças
+
+| Modelo | Uso | Licença |
+| --- | --- | --- |
+| whisper.cpp `small.en` / `large-v3-turbo` | transcrição | MIT |
+| Opus-MT en→pt (convertido para CTranslate2) | tradução | CC BY 4.0 |
+| WeSpeaker ECAPA-TDNN512-LM (`Wespeaker/wespeaker-ecapa-tdnn512-LM`, treinado no VoxCeleb2) | impressão de voz (quem falou) | CC BY 4.0 — © projeto WeSpeaker (wenet-e2e) |

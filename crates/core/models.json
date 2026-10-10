@@ -45,5 +45,14 @@
         "sha256": "b3cf20ccd4e48a89882cfdba157c05fa1cd71a6b69517dfc80e3a34d387ea91f"
       }
     ]
+  },
+  "wespeaker-ecapa512-lm": {
+    "files": [
+      {
+        "name": "voxceleb_ECAPA512_LM.onnx",
+        "path": "Wespeaker/wespeaker-ecapa-tdnn512-LM/resolve/a2f3dcb1c8702caccc7a55ceb57f5e8d1842112b/voxceleb_ECAPA512_LM.onnx",
+        "sha256": "d71b85d9b48058ef68004f04f1b78acebefb9dfcf542e19b976a12a5ad1f10b0"
+      }
+    ]
   }
 }

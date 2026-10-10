@@ -236,7 +236,7 @@ mod tests {
     #[test]
     fn manifest_has_expected_ids_and_real_hashes() {
         let m = manifest();
-        for id in ["whisper-small-en", "whisper-turbo", "opus-mt-en-pt"] {
+        for id in ["whisper-small-en", "whisper-turbo", "opus-mt-en-pt", "wespeaker-ecapa512-lm"] {
             let spec = m.get(id).unwrap_or_else(|| panic!("falta {id}"));
             assert!(spec.files.iter().all(|f| f.sha256.len() == 64), "hash ausente em {id}");
         }
