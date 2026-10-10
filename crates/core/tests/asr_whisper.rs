@@ -1,5 +1,6 @@
 //! Rode com: GOW_MEET_WHISPER=$PWD/models/tmp/ggml-small.en-q5_1.bin cargo test -p gow-meet-core --release --test asr_whisper -- --ignored
 use gow_meet_core::asr::{clean_transcript, Transcriber, WhisperTranscriber};
+use gow_meet_core::lang::Lang;
 use gow_meet_core::{wav::read_wav_16k_mono, wer::wer};
 use std::path::{Path, PathBuf};
 
@@ -13,7 +14,7 @@ fn synthetic_sentences_have_low_wer() {
     for i in 1..=5 {
         let audio = read_wav_16k_mono(&dir.join(format!("s{i}.wav"))).unwrap();
         let reference = std::fs::read_to_string(dir.join(format!("s{i}.txt"))).unwrap();
-        let hyp = clean_transcript(&t.transcribe(&audio).unwrap()).unwrap_or_default();
+        let hyp = clean_transcript(&t.transcribe(&audio).unwrap(), Lang::En).unwrap_or_default();
         let e = wer(&reference, &hyp);
         eprintln!("s{i}: wer={e:.2} | {hyp}");
         total += e;
@@ -27,7 +28,7 @@ fn silence_yields_no_line() {
     let model = PathBuf::from(std::env::var("GOW_MEET_WHISPER").expect("defina GOW_MEET_WHISPER"));
     let mut t = WhisperTranscriber::new(&model, "en", true).unwrap();
     let raw = t.transcribe(&vec![0.0; 16_000 * 3]).unwrap();
-    assert_eq!(clean_transcript(&raw), None, "bruto: {raw:?}");
+    assert_eq!(clean_transcript(&raw, Lang::En), None, "bruto: {raw:?}");
 }
 
 #[test]
@@ -41,5 +42,5 @@ fn short_audio_still_transcribes() {
     let short = &audio[..12_800.min(audio.len())];
     let raw = t.transcribe(short).unwrap();
     eprintln!("short: {raw:?}");
-    assert!(clean_transcript(&raw).is_some(), "bruto: {raw:?}");
+    assert!(clean_transcript(&raw, Lang::En).is_some(), "bruto: {raw:?}");
 }

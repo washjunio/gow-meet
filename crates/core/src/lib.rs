@@ -1,6 +1,7 @@
 pub mod asr;
 pub mod capture;
 pub mod fbank;
+pub mod lang;
 pub mod models;
 pub mod pipeline;
 pub mod resample;

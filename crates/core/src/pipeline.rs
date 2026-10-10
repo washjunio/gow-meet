@@ -341,7 +341,7 @@ fn asr_loop(
                     continue;
                 }
             };
-            let Some(text) = clean_transcript(&raw) else {
+            let Some(text) = clean_transcript(&raw, crate::lang::Lang::En) else {
                 drop_final(sink.as_ref());
                 continue;
             };
@@ -350,7 +350,7 @@ fn asr_loop(
             // Identificação morta (pânico): falas genéricas, sem herdar o último falante.
             let ident = identify.as_mut().filter(|i| job.source == SpeakerSource::System && !i.dead);
             if job.is_final {
-                let mut line = Line { id, t0: job.start_ms, t1: job.end_ms, speaker, text,
+                let mut line = Line { id, t0: job.start_ms, t1: job.end_ms, speaker, lang: crate::lang::Lang::En, text,
                                       translation: None, translation_error: false };
                 // O rastreador fica travado até o evento sair: um `rename_voice` concorrente
                 // é aplicado antes (rótulo novo aqui) ou depois (evento `Speaker` depois).

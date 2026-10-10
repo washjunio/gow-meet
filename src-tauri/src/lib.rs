@@ -572,12 +572,13 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{read_sessions, voices_locked, wipe_library, Slot, Throttle, UiEvent};
+    use gow_meet_core::lang::Lang;
     use gow_meet_core::session::{Line, Meta, Speaker, SpeakerSource};
     use std::time::{Duration, Instant};
 
     #[test]
     fn events_serialize_with_kind_tag() {
-        let line = Line { id: "s0".into(), t0: 0, t1: 900, speaker: Speaker::system(),
+        let line = Line { id: "s0".into(), t0: 0, t1: 900, speaker: Speaker::system(), lang: Lang::En,
             text: "Hello team.".into(), translation: Some("Olá, equipe.".into()), translation_error: false };
         let v = serde_json::to_value(UiEvent::Translated { line }).unwrap();
         assert_eq!(v["kind"], "translated");
@@ -590,11 +591,11 @@ mod tests {
         assert_eq!(v["kind"], "reconnecting");
         let v = serde_json::to_value(UiEvent::Speaker { voice: "v2".into(), label: "Ana".into() }).unwrap();
         assert_eq!(v, serde_json::json!({"kind": "speaker", "voice": "v2", "label": "Ana"}));
-        let line = Line { id: "s1".into(), t0: 0, t1: 900, speaker: Speaker::tracked("v2", "Participante 2"),
+        let line = Line { id: "s1".into(), t0: 0, t1: 900, speaker: Speaker::tracked("v2", "Participante 2"), lang: Lang::En,
             text: "Hi.".into(), translation: None, translation_error: false };
         let v = serde_json::to_value(UiEvent::Final { line }).unwrap();
         assert_eq!(v["line"]["speaker"], serde_json::json!({"source": "system", "label": "Participante 2", "voice": "v2"}));
-        let mic = Line { id: "m0".into(), t0: 0, t1: 1, speaker: Speaker::mic(), text: "Oi.".into(),
+        let mic = Line { id: "m0".into(), t0: 0, t1: 1, speaker: Speaker::mic(), lang: Lang::En, text: "Oi.".into(),
             translation: None, translation_error: false };
         let v = serde_json::to_value(UiEvent::Final { line: mic }).unwrap();
         assert!(v["line"]["speaker"].get("voice").is_none());

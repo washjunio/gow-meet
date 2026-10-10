@@ -1,3 +1,4 @@
+use crate::lang::Lang;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -67,6 +68,9 @@ pub struct Line {
     pub t0: u64,
     pub t1: u64,
     pub speaker: Speaker,
+    /// Idioma falado (etapa 3); a tradução é o outro. Linhas antigas, sem o campo: inglês.
+    #[serde(default)]
+    pub lang: Lang,
     pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub translation: Option<String>,
@@ -138,6 +142,12 @@ impl SessionWriter {
         write_speakers(&self.dir, &self.speakers)
     }
 
+    /// Registra modelos carregados depois do início (o par do outro idioma) e regrava o `meta.json`.
+    pub fn add_models(&mut self, models: BTreeMap<String, String>) -> Result<()> {
+        self.meta.models.extend(models);
+        write_meta(&self.dir, &self.meta)
+    }
+
     pub fn finish(mut self, ended_ms: u64) -> Result<PathBuf> {
         self.lines.sync_all()?;
         self.meta.ended = Some(ended_ms);
@@ -197,7 +207,12 @@ pub fn render_markdown(meta: &Meta, lines: &[Line], speakers: &Speakers) -> Stri
         "# {}\n\n- Início: {}\n- Idiomas: {} → {}\n\n",
         meta.title, started, meta.source_lang, meta.target_lang
     );
+    let mut prev: Option<Lang> = None;
     for l in lines {
+        if prev.is_some_and(|p| p != l.lang) {
+            out.push_str(&format!("*— agora em {} —*\n\n", l.lang.name()));
+        }
+        prev = Some(l.lang);
         let tr = l.translation.clone().unwrap_or_else(|| "_(sem tradução)_".into());
         out.push_str(&format!("**[{}] {}:** {}\n> {}\n\n", clock(l.t0), label_for(l, speakers), tr, l.text));
     }
@@ -241,9 +256,51 @@ mod tests {
         }
     }
 
+    use crate::lang::Lang;
+
     fn line(id: &str, t0: u64, text: &str, tr: Option<&str>) -> Line {
-        Line { id: id.into(), t0, t1: t0 + 500, speaker: Speaker::system(),
+        Line { id: id.into(), t0, t1: t0 + 500, speaker: Speaker::system(), lang: Lang::En,
                text: text.into(), translation: tr.map(Into::into), translation_error: false }
+    }
+
+    #[test]
+    fn line_without_lang_is_english_and_lang_is_always_written() {
+        let old = r#"{"id":"s0","t0":0,"t1":500,"speaker":{"source":"system","label":"Participante"},"text":"Hello."}"#;
+        let l: Line = serde_json::from_str(old).unwrap();
+        assert_eq!(l.lang, Lang::En);
+        let pt = Line { lang: Lang::Pt, ..line("s1", 0, "Olá.", None) };
+        assert_eq!(serde_json::to_value(&pt).unwrap()["lang"], "pt");
+        assert_eq!(serde_json::to_value(&l).unwrap()["lang"], "en");
+    }
+
+    #[test]
+    fn markdown_marks_language_changes() {
+        let lines = vec![
+            line("s0", 0, "Hello team.", Some("Olá, equipe.")),
+            Line { lang: Lang::Pt, ..line("s1", 1_000, "Bom dia.", Some("Good morning.")) },
+            Line { lang: Lang::Pt, ..line("m0", 2_000, "Vamos começar.", Some("Let's start.")) },
+            line("s2", 3_000, "Thanks.", Some("Obrigado.")),
+        ];
+        let md = render_markdown(&meta("x"), &lines, &Speakers::new());
+        assert_eq!(md.matches("*— agora em português —*").count(), 1);
+        assert_eq!(md.matches("*— agora em inglês —*").count(), 1);
+        let (a, b) = (md.find("Olá, equipe.").unwrap(), md.find("agora em português").unwrap());
+        assert!(a < b && b < md.find("Good morning.").unwrap());
+        // Reunião de um idioma só: sem separador.
+        let one = render_markdown(&meta("y"), &lines[..1], &Speakers::new());
+        assert!(!one.contains("agora em"));
+    }
+
+    #[test]
+    fn add_models_rewrites_meta() {
+        let root = tempfile::tempdir().unwrap();
+        let mut w = SessionWriter::create(root.path(), meta("s9")).unwrap();
+        w.add_models([("asr_pt".to_string(), "whisper-small".to_string())].into()).unwrap();
+        let m: Meta = serde_json::from_slice(&std::fs::read(w.dir().join("meta.json")).unwrap()).unwrap();
+        assert_eq!(m.models.get("asr_pt").map(String::as_str), Some("whisper-small"));
+        let md = w.finish(2_000).unwrap();
+        let m: Meta = serde_json::from_slice(&std::fs::read(md.parent().unwrap().join("meta.json")).unwrap()).unwrap();
+        assert_eq!(m.models.get("asr_pt").map(String::as_str), Some("whisper-small"));
     }
 
     #[test]

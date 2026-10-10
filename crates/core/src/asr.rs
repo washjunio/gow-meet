@@ -1,3 +1,4 @@
+use crate::lang::Lang;
 use anyhow::{Context, Result};
 use std::path::Path;
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperState};
@@ -6,14 +7,24 @@ pub trait Transcriber: Send {
     fn transcribe(&mut self, audio: &[f32]) -> Result<String>;
 }
 
-const HALLUCINATIONS: &[&str] = &[
+/// Frases que o Whisper inventa em silêncio, por idioma (minúsculas, comparação exata).
+const HALLUCINATIONS_EN: &[&str] = &[
     "thanks for watching!", "thank you for watching.", "thank you for watching!",
     "subtitles by the amara.org community",
 ];
+/// Português: conhecidas do Whisper e as da medição (`docs/modelos-pt.md`, seção Alucinações).
+const HALLUCINATIONS_PT: &[&str] = &[
+    "legendas pela comunidade amara.org", "obrigado por assistir.", "obrigado por assistir!",
+    "obrigado por assistir",
+];
+
+fn hallucinations(lang: Lang) -> &'static [&'static str] {
+    match lang { Lang::En => HALLUCINATIONS_EN, Lang::Pt => HALLUCINATIONS_PT }
+}
 
 /// Remove marcadores como `[BLANK_AUDIO]`, `(music)`, `*laughs*` e frases que o
 /// Whisper inventa em silêncio. `None` quando não sobra fala.
-pub fn clean_transcript(raw: &str) -> Option<String> {
+pub fn clean_transcript(raw: &str, lang: Lang) -> Option<String> {
     let mut out = String::with_capacity(raw.len());
     let mut depth = 0i32;
     let mut in_star = false;
@@ -27,7 +38,7 @@ pub fn clean_transcript(raw: &str) -> Option<String> {
         }
     }
     let text = out.split_whitespace().collect::<Vec<_>>().join(" ");
-    if text.is_empty() || HALLUCINATIONS.contains(&text.to_lowercase().as_str()) { return None; }
+    if text.is_empty() || hallucinations(lang).contains(&text.to_lowercase().as_str()) { return None; }
     Some(text)
 }
 
@@ -85,19 +96,27 @@ impl Transcriber for WhisperTranscriber {
 #[cfg(test)]
 mod tests {
     use super::{clean_transcript, pad_to_min};
+    use crate::lang::Lang;
     #[test]
     fn keeps_normal_speech() {
-        assert_eq!(clean_transcript("  Let's review the timeline. ").as_deref(), Some("Let's review the timeline."));
+        assert_eq!(clean_transcript("  Let's review the timeline. ", Lang::En).as_deref(), Some("Let's review the timeline."));
+        assert_eq!(clean_transcript(" Vamos revisar o cronograma. ", Lang::Pt).as_deref(), Some("Vamos revisar o cronograma."));
     }
     #[test]
     fn drops_markers_and_hallucinations() {
         for raw in ["[BLANK_AUDIO]", " (music) ", "*laughs*", "Thanks for watching!", "[ Silence ]", ""] {
-            assert_eq!(clean_transcript(raw), None, "{raw:?}");
+            assert_eq!(clean_transcript(raw, Lang::En), None, "{raw:?}");
+        }
+    }
+    #[test]
+    fn portuguese_hallucinations_are_dropped_in_portuguese() {
+        for raw in ["Legendas pela comunidade Amara.org", "Obrigado por assistir!", "[Música]"] {
+            assert_eq!(clean_transcript(raw, Lang::Pt), None, "{raw:?}");
         }
     }
     #[test]
     fn strips_markers_inside_text() {
-        assert_eq!(clean_transcript("[MUSIC] Good morning everyone.").as_deref(), Some("Good morning everyone."));
+        assert_eq!(clean_transcript("[MUSIC] Good morning everyone.", Lang::En).as_deref(), Some("Good morning everyone."));
     }
     #[test]
     fn short_audio_is_padded_past_one_second() {
