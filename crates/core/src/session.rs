@@ -10,11 +10,21 @@ use std::path::{Path, PathBuf};
 pub enum SpeakerSource { Mic, System }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Speaker { pub source: SpeakerSource, pub label: String }
+pub struct Speaker {
+    pub source: SpeakerSource,
+    pub label: String,
+    /// Grupo de voz na reunião (`"v1"`, `"v2"`…). Só em falas do sistema identificadas.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice: Option<String>,
+}
 
 impl Speaker {
-    pub fn mic() -> Self { Self { source: SpeakerSource::Mic, label: "Você".into() } }
-    pub fn system() -> Self { Self { source: SpeakerSource::System, label: "Participante".into() } }
+    pub fn mic() -> Self { Self { source: SpeakerSource::Mic, label: "Você".into(), voice: None } }
+    pub fn system() -> Self { Self { source: SpeakerSource::System, label: "Participante".into(), voice: None } }
+    /// Fala do sistema atribuída ao grupo `voice`.
+    pub fn tracked(voice: &str, label: &str) -> Self {
+        Self { source: SpeakerSource::System, label: label.into(), voice: Some(voice.into()) }
+    }
 }
 
 /// Entrada de `speakers.json`: rótulo atual do grupo e a voz guardada a que ele aponta.
@@ -27,6 +37,27 @@ pub struct SpeakerEntry {
 
 /// `speakers.json`: grupo (`"v1"`) → rótulo. Sessões da etapa 1 não têm o arquivo.
 pub type Speakers = BTreeMap<String, SpeakerEntry>;
+
+const SPEAKERS_FILE: &str = "speakers.json";
+
+pub fn write_speakers(dir: &Path, speakers: &Speakers) -> Result<()> {
+    write_atomic(&dir.join(SPEAKERS_FILE), &serde_json::to_vec_pretty(speakers)?)
+}
+
+/// Ausente: vazio (sessão antiga). Inválido: vazio, com aviso sem conteúdo; as falas
+/// usam então o rótulo gravado em cada linha.
+pub fn read_speakers(dir: &Path) -> Speakers {
+    let Ok(bytes) = fs::read(dir.join(SPEAKERS_FILE)) else { return Speakers::new() };
+    serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+        tracing::warn!(line = e.line(), column = e.column(), "speakers.json inválido; usando os rótulos das falas");
+        Speakers::new()
+    })
+}
+
+/// Rótulo da fala: o de `speakers.json` para o grupo, se houver; senão o da própria linha.
+pub fn label_for<'a>(line: &'a Line, speakers: &'a Speakers) -> &'a str {
+    line.speaker.voice.as_ref().and_then(|v| speakers.get(v)).map_or(line.speaker.label.as_str(), |e| e.label.as_str())
+}
 
 fn is_false(b: &bool) -> bool { !*b }
 
@@ -79,7 +110,7 @@ fn write_meta(dir: &Path, meta: &Meta) -> Result<()> {
     write_atomic(&dir.join("meta.json"), &serde_json::to_vec_pretty(meta)?)
 }
 
-pub struct SessionWriter { dir: PathBuf, meta: Meta, lines: File }
+pub struct SessionWriter { dir: PathBuf, meta: Meta, lines: File, speakers: Speakers }
 
 impl SessionWriter {
     pub fn create(root: &Path, meta: Meta) -> Result<Self> {
@@ -87,7 +118,7 @@ impl SessionWriter {
         fs::create_dir_all(&dir).with_context(|| format!("criar {}", dir.display()))?;
         write_meta(&dir, &meta)?;
         let lines = OpenOptions::new().create(true).append(true).open(dir.join("lines.jsonl"))?;
-        Ok(Self { dir, meta, lines })
+        Ok(Self { dir, meta, lines, speakers: Speakers::new() })
     }
 
     pub fn dir(&self) -> &Path { &self.dir }
@@ -100,18 +131,30 @@ impl SessionWriter {
         Ok(())
     }
 
+    /// Guarda os rótulos em memória e grava `speakers.json`. Se a gravação falhar, a
+    /// memória já vale para o Markdown e a próxima chamada (ou `finish`) tenta de novo.
+    pub fn set_speakers(&mut self, speakers: Speakers) -> Result<()> {
+        self.speakers = speakers;
+        write_speakers(&self.dir, &self.speakers)
+    }
+
     pub fn finish(mut self, ended_ms: u64) -> Result<PathBuf> {
         self.lines.sync_all()?;
         self.meta.ended = Some(ended_ms);
-        close_session(&self.dir, &self.meta)
+        if !self.speakers.is_empty() {
+            if let Err(e) = write_speakers(&self.dir, &self.speakers) {
+                tracing::warn!("speakers.json não gravado ao encerrar: {e:#}");
+            }
+        }
+        close_session(&self.dir, &self.meta, &self.speakers)
     }
 }
 
-fn close_session(dir: &Path, meta: &Meta) -> Result<PathBuf> {
+fn close_session(dir: &Path, meta: &Meta, speakers: &Speakers) -> Result<PathBuf> {
     write_meta(dir, meta)?;
     let lines = replay(&dir.join("lines.jsonl"))?;
     let md = dir.join("transcript.md");
-    write_atomic(&md, render_markdown(meta, &lines).as_bytes())?;
+    write_atomic(&md, render_markdown(meta, &lines, speakers).as_bytes())?;
     Ok(md)
 }
 
@@ -146,7 +189,7 @@ fn clock(ms: u64) -> String {
     format!("{:02}:{:02}:{:02}", s / 3600, (s / 60) % 60, s % 60)
 }
 
-pub fn render_markdown(meta: &Meta, lines: &[Line]) -> String {
+pub fn render_markdown(meta: &Meta, lines: &[Line], speakers: &Speakers) -> String {
     use chrono::TimeZone;
     let started = chrono::Local.timestamp_millis_opt(meta.started as i64).single()
         .map(|d| d.format("%d/%m/%Y %H:%M").to_string()).unwrap_or_default();
@@ -156,7 +199,7 @@ pub fn render_markdown(meta: &Meta, lines: &[Line]) -> String {
     );
     for l in lines {
         let tr = l.translation.clone().unwrap_or_else(|| "_(sem tradução)_".into());
-        out.push_str(&format!("**[{}] {}:** {}\n> {}\n\n", clock(l.t0), l.speaker.label, tr, l.text));
+        out.push_str(&format!("**[{}] {}:** {}\n> {}\n\n", clock(l.t0), label_for(l, speakers), tr, l.text));
     }
     out
 }
@@ -175,7 +218,7 @@ pub fn recover_unfinished(root: &Path) -> Result<Vec<PathBuf>> {
         // Só o caminho é logado: o conteúdo das falas nunca vai para o log.
         let result = replay(&dir.join("lines.jsonl")).and_then(|lines| {
             meta.ended = Some(lines.iter().map(|l| l.t1).max().map_or(meta.started, |t| meta.started + t));
-            close_session(&dir, &meta)
+            close_session(&dir, &meta, &read_speakers(&dir))
         });
         match result {
             Ok(_) => done.push(dir),
@@ -323,6 +366,86 @@ mod tests {
         use chrono::TimeZone;
         let dt = chrono::Local.with_ymd_and_hms(2026, 10, 8, 14, 32, 10).unwrap();
         assert_eq!(session_id(dt), "2026-10-08_143210");
+    }
+
+    fn tracked(id: &str, t0: u64, voice: &str, label: &str, text: &str) -> Line {
+        Line { speaker: Speaker::tracked(voice, label), ..line(id, t0, text, Some("ok")) }
+    }
+
+    fn speakers(pairs: &[(&str, &str, Option<&str>)]) -> Speakers {
+        pairs.iter().map(|(v, l, id)| (v.to_string(), SpeakerEntry { label: l.to_string(), voice_id: id.map(Into::into) })).collect()
+    }
+
+    #[test]
+    fn speakers_json_is_atomic_and_round_trips() {
+        let root = tempfile::tempdir().unwrap();
+        let mut w = SessionWriter::create(root.path(), meta("sp1")).unwrap();
+        let s = speakers(&[("v1", "Ana", Some("abc-0")), ("v2", "Participante 2", None)]);
+        w.set_speakers(s.clone()).unwrap();
+        let dir = w.dir().to_path_buf();
+        assert_eq!(read_speakers(&dir), s);
+        let raw = std::fs::read_to_string(dir.join("speakers.json")).unwrap();
+        assert!(raw.contains("\"voice_id\": \"abc-0\""));
+        assert!(!raw.contains("\"voice_id\": null"));
+        assert!(std::fs::read_dir(&dir).unwrap().all(|e| !e.unwrap().file_name().to_string_lossy().ends_with(".tmp")));
+    }
+
+    #[test]
+    fn markdown_uses_speakers_json_names_even_for_earlier_lines() {
+        let root = tempfile::tempdir().unwrap();
+        let mut w = SessionWriter::create(root.path(), meta("sp2")).unwrap();
+        w.append(&tracked("s0", 1_000, "v1", "Participante 1", "Hello team.")).unwrap();
+        w.append(&tracked("s1", 2_000, "v2", "Participante 2", "Good morning.")).unwrap();
+        w.append(&line("m0", 3_000, "Hi.", Some("Oi."))).unwrap();
+        // Renomeado depois das falas: só o speakers.json muda.
+        w.set_speakers(speakers(&[("v1", "Ana", Some("abc-0")), ("v2", "Participante 2", None)])).unwrap();
+        let md = std::fs::read_to_string(w.finish(9_000).unwrap()).unwrap();
+        assert!(md.contains("**[00:00:01] Ana:** ok"), "{md}");
+        assert!(md.contains("**[00:00:02] Participante 2:** ok"), "{md}");
+        assert!(md.contains("**[00:00:03] Participante:** Oi."), "{md}");
+    }
+
+    #[test]
+    fn old_sessions_without_voice_or_speakers_json_still_work() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("antiga");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("meta.json"), serde_json::to_vec(&meta("antiga")).unwrap()).unwrap();
+        // Registro exatamente como a etapa 1 gravava: speaker sem `voice`.
+        std::fs::write(dir.join("lines.jsonl"),
+            "{\"id\":\"s0\",\"t0\":0,\"t1\":900,\"speaker\":{\"source\":\"system\",\"label\":\"Participante\"},\"text\":\"Hello team.\",\"translation\":\"Olá, equipe.\"}\n").unwrap();
+        let lines = replay(&dir.join("lines.jsonl")).unwrap();
+        assert_eq!(lines[0].speaker, Speaker::system());
+        assert!(read_speakers(&dir).is_empty());
+        recover_unfinished(root.path()).unwrap();
+        let md = std::fs::read_to_string(dir.join("transcript.md")).unwrap();
+        assert!(md.contains("**[00:00:00] Participante:** Olá, equipe."));
+        // E a etapa 2 continua gravando sem `voice` para o microfone e o sistema genérico.
+        assert!(!serde_json::to_string(&Speaker::mic()).unwrap().contains("voice"));
+    }
+
+    #[test]
+    fn recovery_uses_names_from_speakers_json() {
+        let root = tempfile::tempdir().unwrap();
+        let mut w = SessionWriter::create(root.path(), meta("sp3")).unwrap();
+        w.append(&tracked("s0", 2_000, "v1", "Participante 1", "Hello team.")).unwrap();
+        w.set_speakers(speakers(&[("v1", "Ana", Some("abc-0"))])).unwrap();
+        drop(w); // queda: sem finish
+        recover_unfinished(root.path()).unwrap();
+        let md = std::fs::read_to_string(root.path().join("sp3/transcript.md")).unwrap();
+        assert!(md.contains("**[00:00:02] Ana:** ok"), "{md}");
+    }
+
+    #[test]
+    fn corrupt_speakers_json_falls_back_to_line_labels() {
+        let root = tempfile::tempdir().unwrap();
+        let mut w = SessionWriter::create(root.path(), meta("sp4")).unwrap();
+        w.append(&tracked("s0", 0, "v1", "Participante 1", "Hello team.")).unwrap();
+        std::fs::write(w.dir().join("speakers.json"), "{ quebrado").unwrap();
+        drop(w);
+        recover_unfinished(root.path()).unwrap();
+        let md = std::fs::read_to_string(root.path().join("sp4/transcript.md")).unwrap();
+        assert!(md.contains("**[00:00:00] Participante 1:** ok"), "{md}");
     }
 
     #[test]
