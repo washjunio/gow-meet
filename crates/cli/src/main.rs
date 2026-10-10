@@ -20,6 +20,8 @@ struct Args {
     #[arg(long)] opus: PathBuf,
     /// Prefixo de idioma de destino do Opus-MT (ex.: '>>pob<<').
     #[arg(long)] prefix: Option<String>,
+    /// Idioma falado no áudio: en (padrão) ou pt.
+    #[arg(long, default_value = "en")] lang: String,
     /// Desliga a GPU do Whisper.
     #[arg(long)] cpu: bool,
     /// Alimenta o áudio sem esperar o tempo real (latência não é medida).
@@ -78,11 +80,12 @@ fn main() -> Result<()> {
     let a = Args::parse();
     let cfg = PipelineConfig::default();
     let silence_close_ms = cfg.segmenter.silence_close_ms;
-    let asr = WhisperTranscriber::new(&a.whisper, "en", !a.cpu)?;
+    let asr = WhisperTranscriber::new(&a.whisper, &a.lang, !a.cpu)?;
     let tr = Ct2Translator::new(&a.opus, a.prefix.clone())?;
     let now = chrono::Local::now();
     let meta = Meta { v: 1, id: session_id(now), title: "CLI".into(), started: now.timestamp_millis() as u64,
-        ended: None, source_lang: "en".into(), target_lang: "pt".into(), models: Default::default(),
+        ended: None, source_lang: a.lang.clone(),
+        target_lang: if a.lang == "pt" { "en".into() } else { "pt".into() }, models: Default::default(),
         app_version: gow_meet_core::version().into() };
     let started = meta.started;
     let writer = SessionWriter::create(&a.out, meta)?;
