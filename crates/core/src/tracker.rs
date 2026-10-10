@@ -35,6 +35,9 @@ struct Group {
     /// Voz guardada com que o grupo foi reconhecido. Continua trazendo as falas dessa
     /// voz para o grupo mesmo depois de o usuário dar outro nome a ele.
     recognized: Option<String>,
+    /// Voz criada ao nomear este grupo NESTA reunião. Só ela pode ser renomeada ou apagada
+    /// por um novo nome do grupo; uma voz só reconhecida nunca é alterada.
+    created: Option<String>,
     /// Soma das impressões de todas as falas do grupo (o centroide é a soma normalizada).
     sum: Vec<f32>,
     count: u64,
@@ -109,11 +112,36 @@ impl SpeakerTracker {
 
     /// Dá nome ao grupo `voice`: grava a impressão do grupo na biblioteca (voz nova ou
     /// somada à de mesmo nome) e passa a mostrar o nome. Uma voz guardada com que o grupo
-    /// tinha sido reconhecido não muda.
+    /// tinha sido reconhecido não muda. Renomear de novo um grupo já nomeado nesta reunião
+    /// corrige a voz criada (renomeia, ou funde na voz de mesmo nome e apaga a criada),
+    /// sem deixar o nome antigo nem contar as falas duas vezes.
     pub fn rename(&mut self, voice: &str, name: &str, now: u64) -> Result<Assignment> {
         let name = crate::voices::clean_name(name)?;
         let i = self.groups.iter().position(|g| g.voice == voice).context("voz inexistente nesta reunião")?;
         let same = self.library.find_name(&self.model, &name).map(|v| v.id.clone());
+        let created = self.groups[i].created.clone();
+
+        if let Some(cid) = created {
+            match same {
+                // Nome livre, ou só difere em maiúsculas da própria voz criada: corrige o nome.
+                None => self.library.rename(&cid, &name)?,
+                Some(ref s) if *s == cid => self.library.rename(&cid, &name)?,
+                // Já existe outra voz com esse nome: funde nela uma vez e apaga a criada.
+                Some(other) => {
+                    let g = &self.groups[i];
+                    self.library.add_to(&other, &g.sum, g.count, now)?;
+                    self.library.delete(&cid)?;
+                    let g = &mut self.groups[i];
+                    g.voice_id = Some(other.clone());
+                    g.created = None;
+                    g.clear_pending();
+                    tracing::info!(voice = %g.voice, id = %other, falas = g.count, "voz nomeada fundida em voz existente");
+                }
+            }
+            self.groups[i].label = name;
+            return Ok(self.assignment(i));
+        }
+
         let g = &self.groups[i];
         if same.is_some() && same == g.voice_id {
             // Mesmo nome da voz que o grupo já alimenta: as falas pendentes vão no fim.
@@ -124,6 +152,7 @@ impl SpeakerTracker {
         let g = &mut self.groups[i];
         g.label = name;
         g.voice_id = Some(id.clone());
+        g.created = if same.is_none() { Some(id.clone()) } else { None };
         g.clear_pending();
         tracing::info!(voice = %g.voice, id = %id, falas = g.count, "voz nomeada");
         Ok(self.assignment(i))
@@ -188,7 +217,7 @@ impl SpeakerTracker {
     fn create(&mut self, dim: usize, label: String, recognized: Option<String>) -> usize {
         let voice = format!("v{}", self.groups.len() + 1);
         self.groups.push(Group {
-            voice, label, voice_id: recognized.clone(), recognized,
+            voice, label, voice_id: recognized.clone(), recognized, created: None,
             sum: vec![0.0; dim], count: 0, pending: vec![0.0; dim], pending_count: 0,
         });
         self.groups.len() - 1
@@ -344,5 +373,71 @@ mod tests {
         t.finish(5);
         t.save_library().unwrap();
         assert!(!d.path().join(VOICES_FILE).exists());
+    }
+
+    #[test]
+    fn fixing_a_typo_renames_the_session_voice_instead_of_adding_another() {
+        let d = tempfile::tempdir().unwrap();
+        let mut t = tracker(d.path());
+        t.assign(Some(&A), 2_000);
+        t.assign(Some(&A2), 2_000);
+        t.rename("v1", "Brnuo", 10).unwrap();
+        t.rename("v1", "Bruno", 11).unwrap();
+        assert_eq!(t.library.len(), 1);
+        let id = t.speakers()["v1"].voice_id.clone().unwrap();
+        let v = t.library.get(&id).unwrap();
+        assert_eq!((v.name.as_str(), v.count), ("Bruno", 2));
+        assert!(t.library.find_name(M, "Brnuo").is_none());
+        assert_eq!(t.assign(Some(&A), 2_000), a("v1", "Bruno"));
+    }
+
+    #[test]
+    fn renaming_back_and_forth_does_not_double_count() {
+        let d = tempfile::tempdir().unwrap();
+        let mut t = tracker(d.path());
+        t.assign(Some(&A), 2_000);
+        t.assign(Some(&A2), 2_000);
+        t.rename("v1", "Bruno", 10).unwrap();
+        t.rename("v1", "Carlos", 11).unwrap();
+        t.rename("v1", "Bruno", 12).unwrap();
+        assert_eq!(t.library.len(), 1);
+        let id = t.speakers()["v1"].voice_id.clone().unwrap();
+        assert_eq!(t.library.get(&id).unwrap().count, 2);
+        t.finish(20);
+        assert_eq!(t.library.get(&id).unwrap().count, 2);
+    }
+
+    #[test]
+    fn renaming_to_an_existing_voice_merges_once_and_drops_the_session_voice() {
+        let d = tempfile::tempdir().unwrap();
+        let mut lib = VoiceLibrary::empty(&d.path().join(VOICES_FILE));
+        let ana = lib.add_named(M, "Ana", &C, 5, 1).unwrap();
+        let mut t = SpeakerTracker::new(TrackerConfig::default(), M, lib);
+        t.assign(Some(&A), 2_000);
+        t.assign(Some(&A2), 2_000);
+        t.rename("v1", "Zed", 10).unwrap();
+        assert_eq!(t.library.len(), 2);
+        assert_eq!(Some(t.rename("v1", "ana", 11).unwrap()), a("v1", "ana"));
+        assert_eq!(t.library.len(), 1);
+        assert!(t.library.find_name(M, "Zed").is_none());
+        assert_eq!(t.speakers()["v1"].voice_id.as_deref(), Some(ana.as_str()));
+        assert_eq!(t.library.get(&ana).unwrap().count, 7);
+        t.finish(20);
+        assert_eq!(t.library.get(&ana).unwrap().count, 7);
+    }
+
+    #[test]
+    fn renaming_a_recognized_group_twice_never_touches_the_original() {
+        let d = tempfile::tempdir().unwrap();
+        let mut lib = VoiceLibrary::empty(&d.path().join(VOICES_FILE));
+        let ana = lib.add_named(M, "Ana", &A, 5, 1).unwrap();
+        let before = lib.get(&ana).unwrap().clone();
+        let mut t = SpeakerTracker::new(TrackerConfig::default(), M, lib);
+        t.assign(Some(&A2), 2_000);
+        t.rename("v1", "Brnuo", 10).unwrap();
+        t.rename("v1", "Bruno", 11).unwrap();
+        assert_eq!(t.library.get(&ana).unwrap(), &before);
+        assert_eq!(t.library.len(), 2);
+        assert_eq!(t.library.find_name(M, "Bruno").map(|v| v.count), Some(1));
     }
 }

@@ -220,10 +220,24 @@ impl VoiceLibrary {
         let name = self.path.file_name().and_then(|n| n.to_str()).unwrap_or(VOICES_FILE).to_string();
         let prefix = format!("{name}.");
         if let Some(dir) = self.path.parent() {
-            for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+            let entries = match fs::read_dir(dir) {
+                Ok(e) => e,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    self.dirty.store(false, Ordering::Relaxed);
+                    self.protect_original = false;
+                    return Ok(());
+                }
+                Err(e) => return Err(e).context("listar a pasta das vozes guardadas"),
+            };
+            for entry in entries {
+                let entry = entry.context("listar a pasta das vozes guardadas")?;
                 let file = entry.file_name().to_string_lossy().into_owned();
                 if file == name || file.starts_with(&prefix) {
-                    fs::remove_file(entry.path()).context("apagar o arquivo de vozes")?;
+                    match fs::remove_file(entry.path()) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(e).context("apagar o arquivo de vozes"),
+                    }
                 }
             }
         }
@@ -434,5 +448,23 @@ mod tests {
         assert!(clean_name("").is_err());
         assert!(clean_name(&"x".repeat(61)).is_err());
         assert!(clean_name(&"é".repeat(60)).is_ok());
+    }
+
+    #[test]
+    fn delete_all_reports_failures_instead_of_leaving_voices_behind() {
+        // voices.json que não pode ser removido (é uma pasta): erro.
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir(d.path().join(VOICES_FILE)).unwrap();
+        let mut l = lib(d.path());
+        assert!(l.delete_all().is_err());
+        // Pasta ilegível (o "pai" é um arquivo): erro, não sucesso silencioso.
+        let f = d.path().join("arquivo");
+        std::fs::write(&f, "x").unwrap();
+        let mut l = VoiceLibrary::empty(&f.join(VOICES_FILE));
+        #[cfg(unix)]
+        assert!(l.delete_all().is_err());
+        // Pasta inexistente: nada a apagar, Ok.
+        let mut l = VoiceLibrary::empty(&d.path().join("nao-existe").join(VOICES_FILE));
+        assert!(l.delete_all().is_ok());
     }
 }
