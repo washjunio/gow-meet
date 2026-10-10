@@ -11,3 +11,5 @@ Data: 2026-10-09 · Máquina: Mac M2 8 GB · Falas: 4 vozes do `say` × 8 frases
 Escolha: wespeaker-ecapa-tdnn512-LM (empate em qualidade com o CAM++, metade do tempo, menor).
 Limites padrão: grupo 0,65 (0,60 junta duas vozes parecidas), biblioteca 0,70.
 Runtime: tract-onnx 0.23.8 (o ONNX Runtime estático colide com o protobuf do CTranslate2).
+
+CI Windows (commit c794715): tract e rustfft compilam; link segue falhando só pelo ct2rs (LNK2038) — LNK2005/LNK2038 citam apenas libct2rs e libesaxx_rs (esaxx, do sentencepiece), nenhum objeto de tract/rustfft.
