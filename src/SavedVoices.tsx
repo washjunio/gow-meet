@@ -30,7 +30,9 @@ export function SavedVoices(p: SavedVoicesProps) {
     <section className="section">
       <div className="section-head">
         <h2 className="title">Vozes guardadas</h2>
-        {p.voices.length > 0 && (ui.confirm === "all"
+        {/* Sempre visível: mesmo com a lista vazia (arquivo corrompido ou só cópias
+            `voices.json.corrompido-*`) ainda pode haver impressões de voz no disco. */}
+        {(ui.confirm === "all"
           ? (
             <span className="confirm">
               <span>Apagar todas as vozes?</span>
