@@ -117,12 +117,23 @@ impl SpeakerTracker {
     /// somada à de mesmo nome) e passa a mostrar o nome. Uma voz guardada com que o grupo
     /// tinha sido reconhecido não muda. Renomear de novo um grupo já nomeado nesta reunião
     /// corrige a voz criada (renomeia, ou funde na voz de mesmo nome e apaga a criada),
-    /// sem deixar o nome antigo nem contar as falas duas vezes.
+    /// sem deixar o nome antigo nem contar as falas duas vezes — desde que nenhum outro grupo
+    /// também use essa voz.
     pub fn rename(&mut self, voice: &str, name: &str, now: u64) -> Result<Assignment> {
         let name = crate::voices::clean_name(name)?;
         let i = self.groups.iter().position(|g| g.voice == voice).context("voz inexistente nesta reunião")?;
         let same = self.library.find_name(&self.model, &name).map(|v| v.id.clone());
-        let created = self.groups[i].created.clone();
+        let mut created = self.groups[i].created.clone();
+        // A voz criada por este grupo pode ter passado a ser também de outro grupo (o
+        // usuário deu o mesmo nome aos dois). Aí ela não é mais só deste grupo: renomear
+        // ou apagar mudaria a voz do outro. Este grupo segue como um grupo já ligado a uma
+        // voz guardada e ganha (ou soma em) a voz do novo nome.
+        if let Some(cid) = created.as_deref() {
+            if self.groups.iter().enumerate().any(|(j, g)| j != i && g.voice_id.as_deref() == Some(cid)) {
+                self.groups[i].created = None;
+                created = None;
+            }
+        }
 
         if let Some(cid) = created {
             match same {
@@ -427,6 +438,61 @@ mod tests {
         assert_eq!(t.library.get(&ana).unwrap().count, 7);
         t.finish(20);
         assert_eq!(t.library.get(&ana).unwrap().count, 7);
+    }
+
+    /// Dois grupos com o mesmo nome dividem a voz criada pelo primeiro.
+    fn two_groups_sharing_a_created_voice(d: &std::path::Path) -> (SpeakerTracker, String) {
+        let mut t = tracker(d);
+        t.assign(Some(&A), 2_000);
+        t.assign(Some(&B), 2_000);
+        t.rename("v1", "Ana", 10).unwrap();
+        t.rename("v2", "Ana", 11).unwrap();
+        let cid = t.speakers()["v1"].voice_id.clone().unwrap();
+        assert_eq!(t.speakers()["v2"].voice_id.as_deref(), Some(cid.as_str()));
+        assert_eq!(t.library.len(), 1);
+        (t, cid)
+    }
+
+    #[test]
+    fn renaming_a_shared_created_voice_to_a_free_name_keeps_the_other_group_voice() {
+        let d = tempfile::tempdir().unwrap();
+        let (mut t, cid) = two_groups_sharing_a_created_voice(d.path());
+        t.rename("v1", "Bia", 12).unwrap();
+        // A voz do outro grupo continua com o nome dele; o grupo renomeado ganha voz nova.
+        assert_eq!(t.library.get(&cid).unwrap().name, "Ana");
+        let s = t.speakers();
+        assert_eq!(s["v2"].voice_id.as_deref(), Some(cid.as_str()));
+        let bia = s["v1"].voice_id.clone().unwrap();
+        assert_ne!(bia, cid);
+        assert_eq!(t.library.get(&bia).unwrap().name, "Bia");
+        // As falas seguintes do outro grupo entram na voz dele no fim.
+        let before = t.library.get(&cid).unwrap().count;
+        assert_eq!(t.assign(Some(&B), 2_000), a("v2", "Ana"));
+        t.finish(20);
+        assert_eq!(t.library.get(&cid).unwrap().count, before + 1);
+    }
+
+    #[test]
+    fn renaming_a_shared_created_voice_to_an_existing_name_does_not_delete_it() {
+        let d = tempfile::tempdir().unwrap();
+        let mut lib = VoiceLibrary::empty(&d.path().join(VOICES_FILE));
+        let carla = lib.add_named(M, "Carla", &C, 5, 1).unwrap();
+        let mut t = SpeakerTracker::new(TrackerConfig::default(), M, lib);
+        t.assign(Some(&A), 2_000);
+        t.assign(Some(&B), 2_000);
+        t.rename("v1", "Ana", 10).unwrap();
+        t.rename("v2", "Ana", 11).unwrap();
+        let cid = t.speakers()["v1"].voice_id.clone().unwrap();
+        t.rename("v1", "Carla", 12).unwrap();
+        // A voz dividida não é apagada: o outro grupo não fica apontando para o nada.
+        assert!(t.library.get(&cid).is_some());
+        let s = t.speakers();
+        assert_eq!(s["v2"].voice_id.as_deref(), Some(cid.as_str()));
+        assert_eq!(s["v1"].voice_id.as_deref(), Some(carla.as_str()));
+        let before = t.library.get(&cid).unwrap().count;
+        t.assign(Some(&B), 2_000);
+        t.finish(20);
+        assert_eq!(t.library.get(&cid).unwrap().count, before + 1);
     }
 
     #[test]
