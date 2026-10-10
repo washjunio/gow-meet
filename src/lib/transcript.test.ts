@@ -194,4 +194,14 @@ describe("idioma", () => {
     s = applyEvent(s, { kind: "reset" });
     expect(s.language).toEqual({ active: null, pending: null, progress: null });
   });
+
+  it("encerrar limpa o idioma e o preparo pendente", () => {
+    const s = run(
+      { kind: "language", lang: "en", status: "active" },
+      { kind: "language", lang: "pt", status: "preparing", progress: 0.4 },
+      { kind: "stopped", transcript: "/x/transcript.md" },
+    );
+    expect(s.language).toEqual({ active: null, pending: null, progress: null });
+    expect(s.transcript).toBe("/x/transcript.md");
+  });
 });

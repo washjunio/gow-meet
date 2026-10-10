@@ -105,7 +105,7 @@ export function applyEvent(s: State, ev: Action): State {
     case "reconnecting":
       return { ...s, notice: "Reconectando áudio…" };
     case "stopped":
-      return { ...s, transcript: ev.transcript, permissions: {} };
+      return { ...s, transcript: ev.transcript, permissions: {}, language: initial.language };
     case "speaker": {
       const labels = { ...s.labels, [ev.voice]: ev.label };
       const byId: Record<string, Entry> = {};
