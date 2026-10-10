@@ -34,7 +34,7 @@ export function SavedVoices(p: SavedVoicesProps) {
           ? (
             <span className="confirm">
               <span>Apagar todas as vozes?</span>
-              <button className="btn btn-danger btn-small" onClick={() => { reset(); p.onDeleteAll(); }}>Apagar todas</button>
+              <button className="btn btn-danger btn-small" disabled={p.locked} onClick={() => { reset(); p.onDeleteAll(); }}>Apagar todas</button>
               <button className="btn btn-ghost btn-small" onClick={reset}>Cancelar</button>
             </span>
           )
@@ -73,15 +73,16 @@ export function SavedVoices(p: SavedVoicesProps) {
                   {ui.confirm === v.id
                     ? (
                       <>
-                        <button className="btn btn-danger btn-small" onClick={() => { reset(); p.onDelete(v.id); }}>Apagar</button>
+                        <button className="btn btn-danger btn-small" disabled={p.locked} aria-label={`Apagar ${v.name}`}
+                          onClick={() => { reset(); p.onDelete(v.id); }}>Apagar</button>
                         <button className="btn btn-ghost btn-small" onClick={reset}>Cancelar</button>
                       </>
                     )
                     : (
                       <>
-                        <button className="btn btn-ghost btn-small" disabled={p.locked}
+                        <button className="btn btn-ghost btn-small" disabled={p.locked} aria-label={`Renomear ${v.name}`}
                           onClick={() => setUi({ ...idle, editing: v.id })}>Renomear</button>
-                        <button className="btn btn-ghost btn-small" disabled={p.locked}
+                        <button className="btn btn-ghost btn-small" disabled={p.locked} aria-label={`Apagar ${v.name}`}
                           onClick={() => setUi({ ...idle, confirm: v.id })}>Apagar</button>
                       </>
                     )}

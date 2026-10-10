@@ -6,6 +6,7 @@ import logo from "./assets/brand/gow-horizontal-negativo.png";
 import { IconDocument, IconHeadphones, IconMegaphone } from "./icons";
 import { formatDate, formatDuration, percent } from "./lib/format";
 import type { PermissionKind } from "./lib/transcript";
+import { voicesMessage } from "./lib/status";
 import { resetTranscript, useGowMeet } from "./lib/useGowMeet";
 import { SavedVoices, type SavedVoice, type VoicesUi } from "./SavedVoices";
 
@@ -48,16 +49,20 @@ export function MainWindow() {
   const [sessions, setSessions] = useState<Session[]>([]);
 
   const [voices, setVoices] = useState<SavedVoice[]>([]);
-  const [voicesError, setVoicesError] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
 
   const refresh = () => {
     invoke<Session[]>("list_sessions").then(setSessions).catch(() => {});
-    loadVoices(setVoices, setVoicesError);
+    loadVoices(setVoices, setLoadError);
   };
-  /** Ação nas vozes guardadas: o erro aparece na seção; a lista é relida sempre. */
+  /** Ação nas vozes guardadas: o erro fica na seção até a próxima ação que der certo;
+   *  reler a lista não o apaga. */
   const voiceAction = (cmd: string, args?: Record<string, unknown>) =>
-    invoke(cmd, args).catch((e) => setVoicesError(String(e)))
-      .finally(() => loadVoices(setVoices, setVoicesError));
+    invoke(cmd, args)
+      .then(() => setActionError(null))
+      .catch((e) => setActionError(String(e)))
+      .finally(() => loadVoices(setVoices, setLoadError));
   useEffect(() => {
     refresh();
     const un = listen<Progress>("models-progress", (e) =>
@@ -103,7 +108,7 @@ export function MainWindow() {
       permissions={state.permissions}
       onOpenSettings={(k) => openUrl(SETTINGS[k].url).catch((e) => setError(String(e)))}
       lastTranscript={state.transcript} sessions={sessions} onOpen={open}
-      voices={voices} voicesError={voicesError}
+      voices={voices} voicesError={voicesMessage(actionError, loadError)}
       onRenameVoice={(id, name) => voiceAction("rename_saved_voice", { id, name })}
       onDeleteVoice={(id) => voiceAction("delete_voice", { id })}
       onDeleteAllVoices={() => voiceAction("delete_all_voices")}

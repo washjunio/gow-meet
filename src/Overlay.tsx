@@ -1,8 +1,9 @@
 import { invoke } from "@tauri-apps/api/core";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import symbol from "./assets/brand/gow-simbolo-negativo.png";
 import { IconPencil } from "./icons";
 import { MAX_NAME, nameKey } from "./lib/rename";
+import { overlayStatus } from "./lib/status";
 import { lastEntries, type Speaker, type State } from "./lib/transcript";
 import { useGowMeet } from "./lib/useGowMeet";
 
@@ -21,9 +22,18 @@ export function OverlayView({ state, onRename, editing }: { state: State; onRena
   const [renameError, setRenameError] = useState<string | null>(null);
   const entries = lastEntries(state, 3);
   const hasPermissionIssue = Object.keys(state.permissions).length > 0;
-  const status = hasPermissionIssue
-    ? "Falta permissão de áudio: veja a janela principal"
-    : renameError ?? (state.lagMs ? `Atraso de ${Math.round(state.lagMs / 1000)} s` : state.notice);
+  const status = overlayStatus({
+    permissionIssue: hasPermissionIssue, renameError, lagMs: state.lagMs, notice: state.notice,
+  });
+  // O erro de nome é temporário e não passa para a reunião seguinte (estado zerado).
+  useEffect(() => {
+    if (!renameError) return;
+    const t = setTimeout(() => setRenameError(null), 5000);
+    return () => clearTimeout(t);
+  }, [renameError]);
+  useEffect(() => {
+    if (state.order.length === 0) setRenameError(null);
+  }, [state.order.length]);
   const rename = onRename && ((voice: string, name: string) => {
     setRenameError(null);
     return onRename(voice, name).catch((e) => setRenameError(`Nome não salvo: ${String(e)}`));
@@ -35,10 +45,10 @@ export function OverlayView({ state, onRename, editing }: { state: State; onRena
         {entries.length > 0 && (
           <span className="overlay-live" data-tauri-drag-region><span className="dot" />Ao vivo</span>
         )}
-        {status && (
-          <span className={`overlay-status ${!hasPermissionIssue && (renameError || state.lagMs) ? "lag" : ""}`}
+        {status.text && (
+          <span className={`overlay-status ${status.warn ? "lag" : ""}`} role="status" aria-live="polite"
             data-tauri-drag-region>
-            {status}
+            {status.text}
           </span>
         )}
       </div>
