@@ -172,6 +172,26 @@ describe("idioma", () => {
     expect(langBreak(run({ kind: "final", line: line("s9", 0, "x", null) }).byId.s9, s.byId.s1)).toBeNull();
   });
 
+  it("id reaproveitado em outro idioma não herda a tradução antiga", () => {
+    const en = { kind: "partial", id: "s0", speaker: sys, t0: 0, text: "Hello", translation: "Olá", lang: "en" } as const;
+    const a = run(en, { kind: "partial", id: "s0", speaker: sys, t0: 0, text: "Bom", translation: null, lang: "pt" });
+    expect(a.byId.s0).toMatchObject({ lang: "pt", translation: null });
+    const b = run(en, { kind: "final", line: { ...pt("s0", 0), translation: undefined } });
+    expect(b.byId.s0).toMatchObject({ lang: "pt", translation: null });
+    // Mesmo idioma (ou sem idioma dos dois lados): continua herdando.
+    const c = run(
+      { kind: "partial", id: "s1", speaker: sys, t0: 0, text: "Bom", translation: "Good", lang: "pt" },
+      { kind: "partial", id: "s1", speaker: sys, t0: 0, text: "Bom dia", translation: null, lang: "pt" },
+      { kind: "final", line: { ...pt("s1", 0), translation: undefined } },
+    );
+    expect(c.byId.s1.translation).toBe("Good");
+    const d = run(
+      { kind: "partial", id: "s2", speaker: sys, t0: 0, text: "Hel", translation: "Olá" },
+      { kind: "final", line: line("s2", 0, "Hello.", undefined) },
+    );
+    expect(d.byId.s2.translation).toBe("Olá");
+  });
+
   it("preparing → active; o progresso fica até vir outro", () => {
     let s = run({ kind: "language", lang: "en", status: "active" });
     expect(s.language).toEqual({ active: "en", pending: null, progress: null });

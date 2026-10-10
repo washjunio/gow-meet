@@ -66,9 +66,14 @@ function upsert(s: State, e: Entry): State {
   return { ...s, byId, order };
 }
 
+/** Tradução que a entrada anterior com o mesmo id pode passar adiante: só se for do mesmo
+ *  idioma (um id reaproveitado em outro idioma não herda a tradução antiga). */
+const inherited = (prev: Entry | undefined, lang: Lang | null): string | null =>
+  prev && (prev.lang ?? null) === lang ? prev.translation : null;
+
 const fromLine = (l: Line, labels: Record<string, string>, prev?: Entry): Entry => ({
   id: l.id, speaker: relabel(l.speaker, labels), t0: l.t0, text: l.text, final: true,
-  translation: l.translation ?? prev?.translation ?? null,
+  translation: l.translation ?? inherited(prev, l.lang ?? null),
   translationError: !!l.translation_error, lang: l.lang ?? null,
 });
 
@@ -79,10 +84,10 @@ export function applyEvent(s: State, ev: Action): State {
     case "partial": {
       const prev = s.byId[ev.id];
       if (prev?.final) return s;
+      const lang = ev.lang ?? prev?.lang ?? null;
       return upsert(s, {
         id: ev.id, speaker: ev.speaker, t0: ev.t0, text: ev.text, final: false,
-        translation: ev.translation ?? prev?.translation ?? null, translationError: false,
-        lang: ev.lang ?? prev?.lang ?? null,
+        translation: ev.translation ?? inherited(prev, lang), translationError: false, lang,
       });
     }
     case "final":
