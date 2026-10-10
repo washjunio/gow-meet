@@ -14,6 +14,17 @@ Aplicativo desktop em Tauri 2 + React. Etapa 1: macOS primeiro; Windows em segui
 **O áudio nunca é gravado em disco.** Só o texto (original e tradução) é salvo, e os logs
 não contêm o conteúdo das falas.
 
+## Baixar (macOS, Apple Silicon)
+
+Cada versão publicada fica em **Releases** no GitHub, como `gow-meet_<versão>_aarch64.dmg`.
+O app não tem assinatura da Apple: na primeira vez, o macOS bloqueia a abertura. Abra
+**Ajustes do Sistema → Privacidade e Segurança** e clique em **Abrir Mesmo Assim**. A
+cada versão nova, o macOS pede de novo as permissões de microfone e de gravação de tela.
+
+Para publicar uma versão, atualize `version` em `src-tauri/tauri.conf.json` e envie a
+tag correspondente (`git tag v0.1.0 && git push origin v0.1.0`). O workflow `release`
+gera o `.dmg` e cria a Release. Se a tag não bater com a versão, ele para com erro.
+
 ## Pré-requisitos
 
 - Rust (stable, 1.90 ou mais novo) — <https://rustup.rs>
