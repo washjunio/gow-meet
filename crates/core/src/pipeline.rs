@@ -347,7 +347,8 @@ fn asr_loop(
             };
             let mut speaker = speaker_for(job.source);
             // Só o áudio do sistema passa pela identificação; o microfone é sempre "Você".
-            let ident = identify.as_mut().filter(|_| job.source == SpeakerSource::System);
+            // Identificação morta (pânico): falas genéricas, sem herdar o último falante.
+            let ident = identify.as_mut().filter(|i| job.source == SpeakerSource::System && !i.dead);
             if job.is_final {
                 let mut line = Line { id, t0: job.start_ms, t1: job.end_ms, speaker, text,
                                       translation: None, translation_error: false };
@@ -359,11 +360,14 @@ fn asr_loop(
                     let audio = &job.audio[..job.audio.len().saturating_sub(trailing)];
                     let speech_ms = (job.end_ms - job.start_ms).saturating_sub(ident.trailing_ms);
                     let emb = ident.embed(audio, speech_ms, true, sink.as_ref());
-                    let mut t = ident.tracker.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(a) = t.assign(emb.as_deref(), speech_ms) {
-                        line.speaker = Speaker::tracked(&a.voice, &a.label);
+                    // Se o pânico foi agora, esta fala já sai genérica ("Participante").
+                    if !ident.dead {
+                        let mut t = ident.tracker.lock().unwrap_or_else(|e| e.into_inner());
+                        if let Some(a) = t.assign(emb.as_deref(), speech_ms) {
+                            line.speaker = Speaker::tracked(&a.voice, &a.label);
+                        }
+                        tracked = Some(t);
                     }
-                    tracked = Some(t);
                 }
                 if let Some(s) = store.lock().unwrap().as_mut() { s.append(&line, sink.as_ref()); }
                 {
@@ -896,7 +900,20 @@ mod tests {
         let lib = tempfile::tempdir().unwrap();
         let path = lib.path().join(VOICES_FILE);
         std::fs::write(&path, "{ corrompido").unwrap();
+        /// Devolve a permissão de escrita mesmo se uma asserção falhar.
+        struct Restore<'a>(&'a std::path::Path);
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o755));
+            }
+        }
         std::fs::set_permissions(lib.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let _restore = Restore(lib.path());
+        // Como root a permissão não vale: o cenário não se reproduz, então o teste não afirma nada.
+        if std::fs::write(lib.path().join("sonda"), "").is_ok() {
+            eprintln!("permissões não aplicadas (root?); teste ignorado");
+            return;
+        }
         let (library, backup) = VoiceLibrary::load(&path, 1);
         assert!(backup.is_none());
         let root = tempfile::tempdir().unwrap();
@@ -912,12 +929,50 @@ mod tests {
         wait_for(&rx, |e| matches!(e, PipelineEvent::Final(_)));
         assert_eq!(p.rename_voice("v1", "Ana").unwrap(), "Ana");
         let md = std::fs::read_to_string(p.finish(10_000).unwrap()).unwrap();
-        std::fs::set_permissions(lib.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(md.contains("] Ana:**"), "{md}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ corrompido");
         let ev = sink.0.lock().unwrap().clone();
         assert_eq!(errors(&ev).len(), 1, "{ev:?}");
         assert!(!errors(&ev)[0].contains("Ana"));
+    }
+
+    /// Funciona como `EnergyEmbedder` até o gatilho; depois entra em pânico.
+    struct PanicLater(Arc<std::sync::atomic::AtomicBool>);
+    impl SpeakerEmbedder for PanicLater {
+        fn embed(&mut self, a: &[f32]) -> Result<Vec<f32>> {
+            if self.0.load(std::sync::atomic::Ordering::SeqCst) { panic!("falha simulada no modelo de voz") }
+            EnergyEmbedder.embed(a)
+        }
+    }
+
+    #[test]
+    fn after_embedder_panic_lines_are_generic_instead_of_last_speaker() {
+        let lib = tempfile::tempdir().unwrap();
+        let trigger = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (_d, p, sink, rx) = start_tracked(lib.path(), Box::new(PanicLater(trigger.clone())));
+        utterance(&p, SpeakerSource::System, QUIET);
+        utterance(&p, SpeakerSource::System, LOUD);
+        wait_for(&rx, |e| matches!(e, PipelineEvent::Final(l) if l.id == "s1"));
+        p.rename_voice("v2", "Ana").unwrap();
+        trigger.store(true, std::sync::atomic::Ordering::SeqCst);
+        utterance(&p, SpeakerSource::System, LOUD);
+        utterance(&p, SpeakerSource::System, QUIET);
+        utterance(&p, SpeakerSource::Mic, LOUD);
+        p.finish(10_000).unwrap();
+        let ev = sink.0.lock().unwrap().clone();
+        assert_eq!(errors(&ev), vec![SPEAKER_PANIC_MESSAGE.to_string()]);
+        let got: Vec<(String, Speaker)> = finals(&ev).into_iter().map(|l| (l.id, l.speaker)).collect();
+        assert_eq!(got, vec![
+            ("s0".into(), Speaker::tracked("v1", "Participante 1")),
+            ("s1".into(), Speaker::tracked("v2", "Participante 2")),
+            ("s2".into(), Speaker::system()),
+            ("s3".into(), Speaker::system()),
+            ("m0".into(), Speaker::mic()),
+        ]);
+        // Nenhuma parcial depois do pânico herda rótulo de grupo.
+        let first_err = ev.iter().position(|e| matches!(e, PipelineEvent::Error(_))).unwrap();
+        assert!(ev[first_err..].iter().all(|e| !matches!(e,
+            PipelineEvent::Partial { speaker, .. } if speaker.source == SpeakerSource::System && speaker.label != "Participante")));
     }
 
     /// Impressão que sempre falha (sem pânico).
