@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { applyEvent, initial, lastEntries, permissionKind, visibleEntries, type Action, type Line } from "./transcript";
+import { applyEvent, initial, langBreak, lastEntries, permissionKind, visibleEntries, type Action, type Line } from "./transcript";
 
 const sys = { source: "system" as const, label: "Participante" };
 const line = (id: string, t0: number, text: string, translation: string | null | undefined, err = false): Line =>
@@ -151,5 +151,47 @@ describe("visibleEntries", () => {
   it("fala fixada que sumiu (descartada ou reunião nova) é ignorada", () => {
     expect(visibleEntries(four, 3, "x9").map((e) => e.id)).toEqual(["s1", "s2", "s3"]);
     expect(visibleEntries(initial, 3, "s1")).toEqual([]);
+  });
+});
+
+describe("idioma", () => {
+  const pt = (id: string, t0: number): Line =>
+    ({ id, t0, t1: t0 + 900, speaker: sys, lang: "pt", text: "Bom dia.", translation: "Good morning." });
+
+  it("falas guardam o idioma e o separador aparece quando ele muda", () => {
+    const s = run(
+      { kind: "final", line: { ...line("s0", 0, "Hello team.", "Olá, equipe."), lang: "en" } },
+      { kind: "partial", id: "s1", speaker: sys, t0: 1000, text: "Bom", translation: null, lang: "pt" },
+      { kind: "final", line: pt("s2", 2000) },
+    );
+    expect([s.byId.s0.lang, s.byId.s1.lang, s.byId.s2.lang]).toEqual(["en", "pt", "pt"]);
+    expect(langBreak(undefined, s.byId.s0)).toBeNull();
+    expect(langBreak(s.byId.s0, s.byId.s1)).toBe("pt");
+    expect(langBreak(s.byId.s1, s.byId.s2)).toBeNull();
+    // Linha sem idioma (sessão antiga) não gera separador.
+    expect(langBreak(run({ kind: "final", line: line("s9", 0, "x", null) }).byId.s9, s.byId.s1)).toBeNull();
+  });
+
+  it("preparing → active; o progresso fica até vir outro", () => {
+    let s = run({ kind: "language", lang: "en", status: "active" });
+    expect(s.language).toEqual({ active: "en", pending: null, progress: null });
+    s = applyEvent(s, { kind: "language", lang: "pt", status: "preparing", progress: 0.4 });
+    s = applyEvent(s, { kind: "language", lang: "pt", status: "preparing" });
+    expect(s.language).toEqual({ active: "en", pending: "pt", progress: 0.4 });
+    s = applyEvent(s, { kind: "language", lang: "pt", status: "active" });
+    expect(s.language).toEqual({ active: "pt", pending: null, progress: null });
+  });
+
+  it("falha avisa e volta ao idioma atual; nova reunião zera", () => {
+    let s = run(
+      { kind: "language", lang: "en", status: "active" },
+      { kind: "language", lang: "pt", status: "preparing", progress: 0.1 },
+      { kind: "language", lang: "pt", status: "failed" },
+      { kind: "language", lang: "en", status: "active" },
+    );
+    expect(s.language).toEqual({ active: "en", pending: null, progress: null });
+    expect(s.notice).toBe("Não foi possível preparar o português; a reunião continua em inglês.");
+    s = applyEvent(s, { kind: "reset" });
+    expect(s.language).toEqual({ active: null, pending: null, progress: null });
   });
 });

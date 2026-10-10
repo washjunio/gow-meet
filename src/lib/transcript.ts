@@ -1,12 +1,16 @@
+import { LANG_NAME, type Lang, type Language } from "./lang";
+
 /** `voice`: grupo de voz na reunião ("v1"…), só em falas do sistema identificadas. */
 export type Speaker = { source: "mic" | "system"; label: string; voice?: string };
 export type Line = {
   id: string; t0: number; t1: number; speaker: Speaker;
   text: string; translation?: string | null; translation_error?: boolean;
+  /** Idioma falado; ausente em sessões antigas. */
+  lang?: Lang;
 };
 /** Eventos `"gow-meet"` emitidos pelo backend (campo `kind`). */
 export type UiEvent =
-  | { kind: "partial"; id: string; speaker: Speaker; t0: number; text: string; translation?: string | null }
+  | { kind: "partial"; id: string; speaker: Speaker; t0: number; text: string; translation?: string | null; lang?: Lang }
   | { kind: "final"; line: Line }
   | { kind: "translated"; line: Line }
   | { kind: "dropped"; id: string }
@@ -15,7 +19,8 @@ export type UiEvent =
   | { kind: "reconnecting"; source: "mic" | "system" }
   | { kind: "stopped"; transcript: string }
   /** Grupo de voz renomeado: todas as falas com `speaker.voice === voice` mostram `label`. */
-  | { kind: "speaker"; voice: string; label: string };
+  | { kind: "speaker"; voice: string; label: string }
+  | { kind: "language"; lang: Lang; status: "preparing" | "active" | "failed"; progress?: number | null };
 /** `reset` é local do front-end: emitido ao iniciar uma nova sessão. */
 export type Action = UiEvent | { kind: "reset" };
 
@@ -24,6 +29,7 @@ export type PermissionKind = "screen" | "mic";
 export type Entry = {
   id: string; speaker: Speaker; t0: number; text: string;
   translation: string | null; final: boolean; translationError: boolean;
+  lang: Lang | null;
 };
 export type State = {
   order: string[]; byId: Record<string, Entry>;
@@ -33,10 +39,13 @@ export type State = {
   /** Nomes dados nesta reunião (evento `speaker`): valem também para falas e traduções
    *  que chegam depois com o rótulo antigo. */
   labels: Record<string, string>;
+  /** Idioma da reunião e preparo do outro. */
+  language: Language;
 };
 
 export const initial: State = {
   order: [], byId: {}, lagMs: null, notice: null, transcript: null, permissions: {}, labels: {},
+  language: { active: null, pending: null, progress: null },
 };
 
 /** Aplica o nome dado ao grupo de voz, se houver. */
@@ -60,7 +69,7 @@ function upsert(s: State, e: Entry): State {
 const fromLine = (l: Line, labels: Record<string, string>, prev?: Entry): Entry => ({
   id: l.id, speaker: relabel(l.speaker, labels), t0: l.t0, text: l.text, final: true,
   translation: l.translation ?? prev?.translation ?? null,
-  translationError: !!l.translation_error,
+  translationError: !!l.translation_error, lang: l.lang ?? null,
 });
 
 export function applyEvent(s: State, ev: Action): State {
@@ -73,6 +82,7 @@ export function applyEvent(s: State, ev: Action): State {
       return upsert(s, {
         id: ev.id, speaker: ev.speaker, t0: ev.t0, text: ev.text, final: false,
         translation: ev.translation ?? prev?.translation ?? null, translationError: false,
+        lang: ev.lang ?? prev?.lang ?? null,
       });
     }
     case "final":
@@ -102,6 +112,18 @@ export function applyEvent(s: State, ev: Action): State {
       for (const [id, e] of Object.entries(s.byId)) byId[id] = { ...e, speaker: relabel(e.speaker, labels) };
       return { ...s, labels, byId };
     }
+    case "language": {
+      const l = s.language;
+      if (ev.status === "active") return { ...s, language: { active: ev.lang, pending: null, progress: null } };
+      if (ev.status === "preparing") {
+        const progress = ev.progress ?? (l.pending === ev.lang ? l.progress : null);
+        return { ...s, language: { ...l, pending: ev.lang, progress } };
+      }
+      // failed: o backend manda em seguida o `active` do idioma atual.
+      const now = l.active ? `; a reunião continua em ${LANG_NAME[l.active].toLowerCase()}` : "";
+      return { ...s, language: { ...l, pending: null, progress: null },
+               notice: `Não foi possível preparar o ${LANG_NAME[ev.lang].toLowerCase()}${now}.` };
+    }
   }
 }
 
@@ -116,4 +138,9 @@ export function visibleEntries(s: State, n: number, pinned?: string | null): Ent
   const last = lastEntries(s, n);
   if (!pinned || !s.byId[pinned] || last.some((e) => e.id === pinned)) return last;
   return [s.byId[pinned], ...lastEntries(s, n - 1)];
+}
+
+/** Idioma da fala `e` quando ele muda em relação à fala anterior na tela (separador). */
+export function langBreak(prev: Entry | undefined, e: Entry): Lang | null {
+  return prev?.lang && e.lang && prev.lang !== e.lang ? e.lang : null;
 }

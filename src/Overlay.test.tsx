@@ -34,3 +34,27 @@ describe("OverlayView: campo de nome", () => {
     expect(m).toContain("Aguardando fala");
   });
 });
+
+describe("OverlayView: idioma", () => {
+  const fin = (id: string, t0: number, lang: "en" | "pt"): UiEvent => ({
+    kind: "final", line: { id, t0, t1: t0 + 900, speaker: { source: "system", label: "Participante" }, lang,
+      text: `Fictional sentence ${id}.`, translation: `Frase fictícia ${id}.` },
+  });
+  const setLang = () => Promise.resolve();
+
+  it("botão mostra o par atual e o separador marca a troca", () => {
+    const s = [{ kind: "language", lang: "en", status: "active" } as UiEvent, fin("s0", 0, "en"),
+      { kind: "language", lang: "pt", status: "active" } as UiEvent, fin("s1", 1000, "pt")].reduce(applyEvent, initial);
+    const m = renderToStaticMarkup(<OverlayView state={s} onRename={rename} onLang={setLang} />);
+    expect(m).toContain("PT → EN");
+    expect(m).toContain("— agora em português —");
+    expect(m.indexOf("Fictional sentence s0.")).toBeLessThan(m.indexOf("— agora em português —"));
+  });
+
+  it("preparando mostra o progresso; sem reunião não há botão", () => {
+    const s = [{ kind: "language", lang: "en", status: "active" } as UiEvent,
+      { kind: "language", lang: "pt", status: "preparing", progress: 0.4 } as UiEvent].reduce(applyEvent, initial);
+    expect(renderToStaticMarkup(<OverlayView state={s} onLang={setLang} />)).toContain("Preparando português… 40%");
+    expect(renderToStaticMarkup(<OverlayView state={initial} onLang={setLang} />)).not.toContain("lang-toggle");
+  });
+});

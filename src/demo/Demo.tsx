@@ -33,10 +33,12 @@ const baseMain: MainViewProps = {
   error: null, notice: null, permissions: {}, onOpenSettings: noop, lastTranscript: null,
   sessions, onOpen: noop, voices: [], voicesError: null,
   onRenameVoice: noop, onDeleteVoice: noop, onDeleteAllVoices: noop,
+  lang: "en", language: { active: null, pending: null, progress: null }, onLang: noop,
 };
 
 const mainStates: Record<string, MainViewProps> = {
   "main-idle": { ...baseMain, lastTranscript: "/demo/c/transcript.md" },
+  "main-idle-pt": { ...baseMain, lang: "pt", lastTranscript: "/demo/c/transcript.md" },
   "main-voices": { ...baseMain, voices },
   "main-voices-rename": { ...baseMain, voices, voicesUi: { editing: "b", draft: "Bruno S", confirm: null } },
   "main-voices-confirm": { ...baseMain, voices, voicesUi: { editing: null, draft: "", confirm: "c" } },
@@ -56,6 +58,10 @@ const mainStates: Record<string, MainViewProps> = {
       transcript: null }, ...sessions],
     voices,
     permissions: { screen: "Sem permissão de Gravação de Tela e Áudio do Sistema: a fala dos participantes não será capturada." },
+  },
+  "main-running-preparing": {
+    ...baseMain, phase: "running", title: "Planejamento da sprint", voices,
+    lang: "en", language: { active: "en", pending: "pt", progress: 0.4 },
   },
 };
 
@@ -83,11 +89,25 @@ const speakersEv: UiEvent[] = [
     translation: "Claro, posso compartilhar o plano atualizado." } },
   { kind: "speaker", voice: "v1", label: "Ana" },
 ];
+// Etapa 3: reunião que começou em inglês e passou para o português.
+const langEv: UiEvent[] = [
+  { kind: "language", lang: "en", status: "active" },
+  { kind: "final", line: { id: "s0", t0: 0, t1: 2800, speaker: { source: "system", label: "Participante" }, lang: "en",
+    text: "Let's review the project timeline for next week.",
+    translation: "Vamos revisar o cronograma do projeto para a próxima semana." } },
+  { kind: "language", lang: "pt", status: "active" },
+  { kind: "final", line: { id: "s1", t0: 3200, t1: 5400, speaker: { source: "system", label: "Participante" }, lang: "pt",
+    text: "O novo painel precisa ficar pronto até sexta-feira.",
+    translation: "The new dashboard needs to be ready by Friday." } },
+];
 const overlayStates: Record<string, State> = {
   "overlay": ev.reduce(applyEvent, initial),
   "overlay-empty": initial,
   "overlay-speakers": speakersEv.reduce(applyEvent, initial),
   "overlay-rename": speakersEv.reduce(applyEvent, initial),
+  "overlay-languages": langEv.reduce(applyEvent, initial),
+  "overlay-preparing": [...ev, { kind: "language", lang: "en", status: "active" } as UiEvent,
+    { kind: "language", lang: "pt", status: "preparing", progress: 0.4 } as UiEvent].reduce(applyEvent, initial),
 };
 /** Estados da flutuante que abrem com o campo de nome aberto na fala indicada. */
 const overlayEditing: Record<string, NameEdit> = { "overlay-rename": { voice: "v2", entry: "s1", draft: "" } };
@@ -100,7 +120,7 @@ export function Demo({ name }: { name: string }) {
     return (
       <div style={{ minHeight: "100vh", background: "#7a7a7a", padding: 40 }}>
         <div style={{ width: 440, height: 320 }}>
-          <OverlayView state={overlayStates[name]} onRename={() => Promise.resolve()} editing={overlayEditing[name]} />
+          <OverlayView state={overlayStates[name]} onRename={() => Promise.resolve()} onLang={() => Promise.resolve()} editing={overlayEditing[name]} />
         </div>
       </div>
     );

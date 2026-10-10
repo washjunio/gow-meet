@@ -1,14 +1,14 @@
 import { describe, expect, it } from "vitest";
 import { overlayStatus, voicesMessage } from "./status";
 
-const base = { permissionIssue: false, renameError: null, lagMs: null, notice: null };
+const base = { permissionIssue: false, actionError: null, lagMs: null, notice: null };
 
 describe("overlayStatus", () => {
   it("permissão vence tudo", () => {
-    expect(overlayStatus({ ...base, permissionIssue: true, renameError: "x" }).text).toMatch(/permissão/);
+    expect(overlayStatus({ ...base, permissionIssue: true, actionError: "x" }).text).toMatch(/permissão/);
   });
-  it("erro de nome vence atraso; sem ele o atraso e o aviso voltam", () => {
-    expect(overlayStatus({ ...base, renameError: "x", lagMs: 6000, notice: "n" })).toEqual({ text: "x", warn: true });
+  it("erro de ação vence atraso; sem ele o atraso e o aviso voltam", () => {
+    expect(overlayStatus({ ...base, actionError: "x", lagMs: 6000, notice: "n" })).toEqual({ text: "x", warn: true });
     expect(overlayStatus({ ...base, lagMs: 6000, notice: "n" })).toEqual({ text: "Atraso de 6 s", warn: true });
     expect(overlayStatus({ ...base, notice: "Reconectando áudio…" })).toEqual({ text: "Reconectando áudio…", warn: false });
   });

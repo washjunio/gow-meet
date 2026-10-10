@@ -4,6 +4,7 @@ import { openPath, openUrl } from "@tauri-apps/plugin-opener";
 import { useEffect, useState, type ReactNode } from "react";
 import logo from "./assets/brand/gow-horizontal-negativo.png";
 import { IconDocument, IconHeadphones, IconMegaphone } from "./icons";
+import { LANG_NAME, LANGS, loadLang, other, preparingText, saveLang, type Lang, type Language } from "./lib/lang";
 import { formatDate, formatDuration, percent } from "./lib/format";
 import type { PermissionKind } from "./lib/transcript";
 import { voicesMessage } from "./lib/status";
@@ -70,12 +71,27 @@ export function MainWindow() {
     return () => { un.then((f) => f()); };
   }, []);
 
+  const [chosen, setChosen] = useState<Lang>(loadLang);
+  // A troca feita na flutuante também vale como última escolha.
+  const active = state.language.active;
+  useEffect(() => {
+    if (active) { setChosen(active); saveLang(active); }
+  }, [active]);
+  const onLang = (l: Lang) => {
+    if (phase === "running") {
+      invoke("set_language", { lang: l }).catch((e) => setError(String(e)));
+      return;
+    }
+    setChosen(l);
+    saveLang(l);
+  };
+
   async function start() {
     setPhase("starting"); setError(null); setProgress({});
     try {
-      await invoke("ensure_models");
+      await invoke("ensure_models", { lang: chosen });
       await resetTranscript(); // nova sessão: ids s0/m0 voltam a existir
-      await invoke("start_session", { title: title || null });
+      await invoke("start_session", { title: title || null, lang: chosen });
       setPhase("running");
     } catch (e) {
       setError(String(e));
@@ -112,6 +128,7 @@ export function MainWindow() {
       onRenameVoice={(id, name) => voiceAction("rename_saved_voice", { id, name })}
       onDeleteVoice={(id) => voiceAction("delete_voice", { id })}
       onDeleteAllVoices={() => voiceAction("delete_all_voices")}
+      lang={phase === "running" ? active ?? chosen : chosen} language={state.language} onLang={onLang}
     />
   );
 }
@@ -135,6 +152,10 @@ export type MainViewProps = {
   onRenameVoice: (id: string, name: string) => void;
   onDeleteVoice: (id: string) => void;
   onDeleteAllVoices: () => void;
+  /** Idioma mostrado no seletor: o escolhido (parado) ou o que vale na reunião. */
+  lang: Lang;
+  language: Language;
+  onLang: (l: Lang) => void;
   /** Só para o modo demo: estado inicial da seção de vozes. */
   voicesUi?: VoicesUi;
 };
@@ -171,6 +192,7 @@ export function MainView(p: MainViewProps) {
                 {phase === "stopping" ? "Encerrando…" : "Encerrar"}
               </button>
             </div>
+            <LangPicker phase={phase} lang={p.lang} language={p.language} onLang={p.onLang} />
             <p className="note">
               <IconMegaphone />
               <span>Antes de começar, avise os participantes de que a reunião será transcrita.</span>
@@ -256,6 +278,31 @@ export function MainView(p: MainViewProps) {
             initial={p.voicesUi} />
         </main>
       </div>
+    </div>
+  );
+}
+
+/** "Idioma falado": antes de iniciar, escolhe o idioma da reunião; durante, troca. */
+function LangPicker({ phase, lang, language, onLang }: {
+  phase: Phase; lang: Lang; language: Language; onLang: (l: Lang) => void;
+}) {
+  const busy = phase === "starting" || phase === "stopping";
+  const pending = phase === "running" ? language.pending : null;
+  return (
+    <div className="lang-picker">
+      <span className="lang-label" id="lang-label">Idioma falado</span>
+      <div className="lang-options" role="radiogroup" aria-labelledby="lang-label">
+        {LANGS.map((l) => (
+          <button key={l} type="button" role="radio" aria-checked={lang === l}
+            className={`lang-option ${lang === l ? "on" : ""} ${pending === l ? "pending" : ""}`}
+            disabled={busy} onClick={() => onLang(l)}>
+            {LANG_NAME[l]}
+          </button>
+        ))}
+      </div>
+      <span className="lang-hint" role="status">
+        {pending ? preparingText(pending, language.progress) : `tradução para ${LANG_NAME[other(lang)].toLowerCase()}`}
+      </span>
     </div>
   );
 }
