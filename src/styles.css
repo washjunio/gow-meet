@@ -138,13 +138,15 @@ body { margin: 0; background: var(--preto); }
 .card-guide { margin: 6px 0 14px; color: var(--texto-2); font-size: 13px; }
 
 .sessions { list-style: none; padding: 0; margin: 0; border-top: 1px solid var(--borda); }
+.session-row { display: flex; align-items: center; border-bottom: 1px solid var(--borda); }
+.session-row:hover { background: var(--superficie); }
+.reveal { width: 40px; height: 40px; flex: none; display: grid; place-items: center; padding: 0; }
 .session {
-  width: 100%; display: grid; grid-template-columns: minmax(0, 1fr) 132px 92px 104px;
+  flex: 1; min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr) 132px 92px 104px;
   gap: 16px; align-items: center; padding: 14px 4px; text-align: left; cursor: pointer;
-  background: transparent; border: 0; border-bottom: 1px solid var(--borda); color: var(--texto);
+  background: transparent; border: 0; color: var(--texto);
   font: 400 14px var(--corpo);
 }
-.session:not(:disabled):hover { background: var(--superficie); }
 .session:not(:disabled):hover .session-title { color: var(--amarelo); }
 .session:focus-visible { outline: 2px solid var(--amarelo); outline-offset: -2px; }
 .session:disabled { cursor: default; }

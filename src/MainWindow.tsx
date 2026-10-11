@@ -1,15 +1,19 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { openPath, openUrl } from "@tauri-apps/plugin-opener";
+import { openPath, openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { useEffect, useState, type ReactNode } from "react";
 import logo from "./assets/brand/gow-horizontal-negativo.png";
-import { IconDocument, IconHeadphones, IconMegaphone } from "./icons";
+import { IconDocument, IconFolder, IconHeadphones, IconMegaphone } from "./icons";
 import { LANG_NAME, LANGS, loadLang, other, preparingText, saveLang, type Lang, type Language } from "./lib/lang";
 import { formatDate, formatDuration, percent } from "./lib/format";
 import type { PermissionKind } from "./lib/transcript";
 import { voicesMessage } from "./lib/status";
 import { resetTranscript, useGowMeet } from "./lib/useGowMeet";
 import { SavedVoices, type SavedVoice, type VoicesUi } from "./SavedVoices";
+
+/** Nome do gerenciador de arquivos do sistema, para o botão que mostra a transcrição. */
+const REVEAL = /Windows/.test(globalThis.navigator?.userAgent ?? "")
+  ? "Mostrar no Explorador de Arquivos" : "Mostrar no Finder";
 
 /** Item de `list_sessions`: `meta.json` + caminho do `transcript.md` (quando já existe). */
 export type Session = {
@@ -116,6 +120,7 @@ export function MainWindow() {
   }
 
   const open = (path: string) => openPath(path).catch((e) => setError(String(e)));
+  const reveal = (path: string) => revealItemInDir(path).catch((e) => setError(String(e)));
 
   return (
     <MainView
@@ -123,7 +128,7 @@ export function MainWindow() {
       progress={Object.values(progress)} error={error} notice={state.notice}
       permissions={state.permissions}
       onOpenSettings={(k) => openUrl(SETTINGS[k].url).catch((e) => setError(String(e)))}
-      lastTranscript={state.transcript} sessions={sessions} onOpen={open}
+      lastTranscript={state.transcript} sessions={sessions} onOpen={open} onReveal={reveal}
       voices={voices} voicesError={voicesMessage(actionError, loadError)}
       onRenameVoice={(id, name) => voiceAction("rename_saved_voice", { id, name })}
       onDeleteVoice={(id) => voiceAction("delete_voice", { id })}
@@ -147,6 +152,8 @@ export type MainViewProps = {
   lastTranscript: string | null;
   sessions: Session[];
   onOpen: (path: string) => void;
+  /** Mostra o arquivo selecionado no Finder (macOS) ou no Explorador de Arquivos (Windows). */
+  onReveal: (path: string) => void;
   voices: SavedVoice[];
   voicesError: string | null;
   onRenameVoice: (id: string, name: string) => void;
@@ -254,7 +261,7 @@ export function MainView(p: MainViewProps) {
               : (
                 <ul className="sessions">
                   {p.sessions.map((s) => (
-                    <li key={s.id}>
+                    <li key={s.id} className="session-row">
                       <button className="session" disabled={!s.transcript}
                         title={s.transcript ? "Abrir a transcrição" : undefined}
                         onClick={() => s.transcript && p.onOpen(s.transcript)}>
@@ -267,6 +274,14 @@ export function MainView(p: MainViewProps) {
                           {s.ended ? "encerrada" : "em andamento"}
                         </span>
                       </button>
+                      {s.transcript
+                        ? (
+                          <button className="btn btn-ghost reveal" title={REVEAL} aria-label={REVEAL}
+                            onClick={() => p.onReveal(s.transcript!)}>
+                            <IconFolder />
+                          </button>
+                        )
+                        : <span className="reveal" aria-hidden />}
                     </li>
                   ))}
                 </ul>

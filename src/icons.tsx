@@ -26,6 +26,12 @@ export const IconDocument = () => (
   </svg>
 );
 
+export const IconFolder = () => (
+  <svg {...base}>
+    <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z" />
+  </svg>
+);
+
 export const IconPencil = () => (
   <svg {...base} width={12} height={12}>
     <path d="M4 20h4L19 9l-4-4L4 16v4z" />

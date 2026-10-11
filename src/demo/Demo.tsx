@@ -31,7 +31,7 @@ const voices: SavedVoice[] = [
 const baseMain: MainViewProps = {
   phase: "idle", title: "", onTitle: noop, onStart: noop, onStop: noop, progress: [],
   error: null, notice: null, permissions: {}, onOpenSettings: noop, lastTranscript: null,
-  sessions, onOpen: noop, voices: [], voicesError: null,
+  sessions, onOpen: noop, onReveal: noop, voices: [], voicesError: null,
   onRenameVoice: noop, onDeleteVoice: noop, onDeleteAllVoices: noop,
   lang: "en", language: { active: null, pending: null, progress: null }, onLang: noop,
 };
