@@ -7,8 +7,6 @@ jobs:
       matrix:
         os: [macos-14, windows-latest]
     runs-on: ${{ matrix.os }}
-    # Windows: link do ct2rs (CRT /MT vs /MD, LNK2038/LNK2005) ainda não resolvido — fica para a Task 9 (spike no notebook Windows).
-    continue-on-error: ${{ matrix.os == 'windows-latest' }}
     env:
       CMAKE_POLICY_VERSION_MINIMUM: "3.5"
     steps:
