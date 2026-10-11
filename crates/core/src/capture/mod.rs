@@ -5,17 +5,22 @@ use crossbeam_channel::Sender;
 
 pub mod clock;
 pub mod mic;
+mod watch;
 #[cfg(target_os = "macos")]
 pub mod mac;
+#[cfg(target_os = "windows")]
+pub mod windows;
 #[cfg(target_os = "macos")]
 pub use mac::SystemSource;
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
+pub use windows::SystemSource;
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub use unsupported::SystemSource;
 pub use clock::SourceClock;
 pub use mic::MicSource;
 
-/// Mantém o CI do Windows compilando até a Task 14 implementar o loopback WASAPI.
-#[cfg(not(target_os = "macos"))]
+/// Plataformas sem captura do áudio do sistema (Linux): o app compila, mas avisa ao iniciar.
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 mod unsupported {
     use super::{AudioSource, CaptureEvent};
     use anyhow::Result;

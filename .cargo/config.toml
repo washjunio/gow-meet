@@ -1,3 +1,10 @@
-# ct2rs compila o CTranslate2 com o CRT estático (/MT); o resto do build precisa do mesmo CRT.
+# Windows: o ct2rs compila o CTranslate2 com o CRT estático (/MT) e não tem opção para o
+# dinâmico; o resto do build precisa do mesmo CRT, senão o link falha (LNK2038/LNK2005).
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static"]
+
+# O whisper-rs-sys ignora o crt-static, mas repassa ao CMake as variáveis CMAKE_* do
+# ambiente. Fora do MSVC o CMake ignora estas duas.
+[env]
+CMAKE_MSVC_RUNTIME_LIBRARY = "MultiThreaded"
+CMAKE_POLICY_DEFAULT_CMP0091 = "NEW"
