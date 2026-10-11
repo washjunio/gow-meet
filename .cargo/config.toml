@@ -1,0 +1,3 @@
+# ct2rs compila o CTranslate2 com o CRT estático (/MT); o resto do build precisa do mesmo CRT.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
