@@ -24,7 +24,7 @@ fn default_name() -> Option<String> {
 /// Aviso quando o microfone só entrega zeros exatos: é assim que o macOS responde
 /// quando o acesso ao Microfone foi negado. A interface reconhece "permissão" + "Microfone".
 pub const MIC_SILENT_MESSAGE: &str =
-    "O microfone só entrega silêncio absoluto: verifique a permissão de Microfone do gow-meet.";
+    "O microfone só entrega silêncio absoluto: verifique a permissão de Microfone do GOW Meet.";
 
 /// Amostras (16 kHz) de zeros exatos antes do aviso: ~3 s.
 const SILENT_LIMIT: u64 = 3 * crate::resample::SAMPLE_RATE as u64;

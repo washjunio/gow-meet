@@ -750,7 +750,7 @@ pub fn run() {
             rename_voice, list_voices, rename_saved_voice, delete_voice, delete_all_voices, set_language
         ])
         .build(tauri::generate_context!())
-        .expect("erro ao iniciar o gow-meet")
+        .expect("erro ao iniciar o GOW Meet")
         .run(|app, event| {
             if let RunEvent::Exit = event { shutdown_on_exit(app); }
         });

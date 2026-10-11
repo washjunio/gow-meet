@@ -231,7 +231,7 @@ export function MainView(p: MainViewProps) {
               <Card key={k} label="Permissão necessária">
                 <p className="card-message">{p.permissions[k]}</p>
                 <p className="card-guide">
-                  Habilite o gow-meet em Ajustes do Sistema → Privacidade e Segurança e inicie de novo.
+                  Habilite o GOW Meet em Ajustes do Sistema → Privacidade e Segurança e inicie de novo.
                 </p>
                 <button className="btn btn-outline btn-small" onClick={() => p.onOpenSettings(k)}>
                   {SETTINGS[k].label}

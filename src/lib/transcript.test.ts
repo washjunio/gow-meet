@@ -130,7 +130,7 @@ describe("applyEvent", () => {
     expect(permissionKind("nenhum microfone")).toBeNull();
     // aviso do backend quando o microfone só entrega zeros exatos (acesso negado)
     expect(permissionKind(
-      "O microfone só entrega silêncio absoluto: verifique a permissão de Microfone do gow-meet.",
+      "O microfone só entrega silêncio absoluto: verifique a permissão de Microfone do GOW Meet.",
     )).toBe("mic");
     expect(permissionKind("GPU indisponível")).toBeNull();
   });

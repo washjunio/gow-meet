@@ -1,6 +1,6 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
-  "productName": "gow-meet",
+  "productName": "GOW Meet",
   "version": "0.1.0",
   "identifier": "com.gow.meet",
   "build": {
@@ -14,14 +14,14 @@
     "windows": [
       {
         "label": "main",
-        "title": "gow-meet",
+        "title": "GOW Meet",
         "url": "index.html",
         "width": 900,
         "height": 640
       },
       {
         "label": "overlay",
-        "title": "gow-meet legendas",
+        "title": "GOW Meet legendas",
         "url": "index.html#overlay",
         "width": 440,
         "height": 320,

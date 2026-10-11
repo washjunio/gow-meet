@@ -1,7 +1,7 @@
-# gow-meet
+# GOW Meet
 
 Legendas ao vivo para reuniões em inglês, traduzidas para o português (pt-BR), rodando
-inteiramente no computador. O gow-meet captura o áudio do sistema (o que os participantes
+inteiramente no computador. O GOW Meet captura o áudio do sistema (o que os participantes
 falam) e o microfone (o que você fala), transcreve o inglês com o Whisper e traduz com o
 Opus-MT. As falas aparecem numa janela flutuante, identificadas como **Você** (microfone) e
 **Participante** (áudio do sistema), e a transcrição fica salva em Markdown ao encerrar.
@@ -16,7 +16,7 @@ não contêm o conteúdo das falas.
 
 ## Baixar (macOS, Apple Silicon)
 
-Cada versão publicada fica em **Releases** no GitHub, como `gow-meet_<versão>_aarch64.dmg`.
+Cada versão publicada fica em **Releases** no GitHub, como `GOW Meet_<versão>_aarch64.dmg`.
 O app não tem assinatura da Apple: na primeira vez, o macOS bloqueia a abertura. Abra
 **Ajustes do Sistema → Privacidade e Segurança** e clique em **Abrir Mesmo Assim**. A
 cada versão nova, o macOS pede de novo as permissões de microfone e de gravação de tela.
@@ -72,7 +72,7 @@ Outras opções: `--cpu` (sem GPU), `--fast` (sem esperar o tempo real), `--repe
 
 ## Permissões do macOS
 
-Em **Ajustes do Sistema → Privacidade e Segurança**, habilite o gow-meet (ou o Terminal,
+Em **Ajustes do Sistema → Privacidade e Segurança**, habilite o GOW Meet (ou o Terminal,
 ao rodar pelo `tauri dev`/CLI) em:
 
 - **Microfone** — para transcrever a sua voz;
