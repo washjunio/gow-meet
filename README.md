@@ -19,8 +19,8 @@ não contêm o conteúdo das falas.
 
 | Sistema | Arquivo |
 |---|---|
-| macOS 13 ou mais novo (Apple Silicon) | `GOW Meet_<versão>_aarch64.dmg` |
-| Windows 10/11 (64 bits) | `GOW Meet_<versão>_x64-setup.exe` |
+| macOS 13 ou mais novo (Apple Silicon) | `GOW.Meet_<versão>_aarch64.dmg` |
+| Windows 10/11 (64 bits) | `GOW.Meet_<versão>_x64-setup.exe` |
 
 O app não tem assinatura da Apple nem da Microsoft, então o sistema avisa na primeira
 abertura:

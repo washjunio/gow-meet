@@ -14,7 +14,7 @@ Baixe a versão mais recente em
 
 **macOS (Apple Silicon, macOS 13 ou mais novo)**
 
-1. Abra o `GOW Meet_<versão>_aarch64.dmg` e arraste o **GOW Meet** para **Aplicativos**.
+1. Abra o `GOW.Meet_<versão>_aarch64.dmg` e arraste o **GOW Meet** para **Aplicativos**.
 2. Na primeira abertura o macOS bloqueia o app, porque ele não tem assinatura da Apple.
    Abra **Ajustes do Sistema → Privacidade e Segurança**, role até o fim e clique em
    **Abrir Mesmo Assim**.
@@ -23,7 +23,7 @@ Baixe a versão mais recente em
 
 **Windows 10/11**
 
-1. Rode o `GOW Meet_<versão>_x64-setup.exe`.
+1. Rode o `GOW.Meet_<versão>_x64-setup.exe`.
 2. O Windows avisa que o instalador não é reconhecido: clique em **Mais informações →
    Executar assim mesmo**.
 
