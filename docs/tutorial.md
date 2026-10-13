@@ -9,7 +9,8 @@ máquina e não é gravado; só o texto da reunião fica salvo.
 
 ## 1. Instalar
 
-Baixe a versão mais recente em **Releases** no GitHub do projeto.
+Baixe a versão mais recente em
+**[Releases](https://github.com/washjunio/gow-meet/releases/latest)**.
 
 **macOS (Apple Silicon, macOS 13 ou mais novo)**
 

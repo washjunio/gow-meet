@@ -1,31 +1,49 @@
 # GOW Meet
 
-Legendas ao vivo para reuniões em inglês, traduzidas para o português (pt-BR), rodando
-inteiramente no computador. O GOW Meet captura o áudio do sistema (o que os participantes
-falam) e o microfone (o que você fala), transcreve o inglês com o Whisper e traduz com o
-Opus-MT. As falas aparecem numa janela flutuante, identificadas como **Você** (microfone) e
-**Participante** (áudio do sistema), e a transcrição fica salva em Markdown ao encerrar.
-Desde a etapa 2, as falas do áudio do sistema são separadas por voz (**Participante 1**,
-**Participante 2**…); clique no rótulo na janela flutuante para dar nome a uma voz. O app
-lembra das vozes nomeadas nas próximas reuniões, neste computador.
+Legendas ao vivo e traduzidas para reuniões, rodando inteiramente no computador. Escolha o
+idioma falado antes de começar — **inglês** (tradução para o português) ou **português**
+(tradução para o inglês) — e troque no meio da reunião se a conversa mudar de idioma.
 
-Aplicativo desktop em Tauri 2 + React. Etapa 1: macOS primeiro; Windows em seguida.
+O GOW Meet captura o áudio do sistema (o que os participantes falam) e o microfone (o que
+você fala), transcreve com o Whisper e traduz com o Opus-MT. As falas aparecem numa janela
+flutuante, separadas por voz (**Você**, **Participante 1**, **Participante 2**…); clique no
+rótulo para dar nome a uma voz, e o app a reconhece nas próximas reuniões, neste computador.
+Ao encerrar, a transcrição fica salva em Markdown.
 
 **O áudio nunca é gravado em disco.** Só o texto (original e tradução) é salvo, e os logs
 não contêm o conteúdo das falas.
 
-Passo a passo de uso, com imagens: [docs/tutorial.md](docs/tutorial.md).
+## Download
 
-## Baixar (macOS, Apple Silicon)
+**[Baixar a versão mais recente](https://github.com/washjunio/gow-meet/releases/latest)**
 
-Cada versão publicada fica em **Releases** no GitHub, como `GOW Meet_<versão>_aarch64.dmg`.
-O app não tem assinatura da Apple: na primeira vez, o macOS bloqueia a abertura. Abra
-**Ajustes do Sistema → Privacidade e Segurança** e clique em **Abrir Mesmo Assim**. A
-cada versão nova, o macOS pede de novo as permissões de microfone e de gravação de tela.
+| Sistema | Arquivo |
+|---|---|
+| macOS 13 ou mais novo (Apple Silicon) | `GOW Meet_<versão>_aarch64.dmg` |
+| Windows 10/11 (64 bits) | `GOW Meet_<versão>_x64-setup.exe` (a partir da próxima versão) |
 
-Para publicar uma versão, atualize `version` em `src-tauri/tauri.conf.json` e envie a
-tag correspondente (`git tag v0.1.0 && git push origin v0.1.0`). O workflow `release`
-gera o `.dmg` e cria a Release. Se a tag não bater com a versão, ele para com erro.
+O app não tem assinatura da Apple nem da Microsoft, então o sistema avisa na primeira
+abertura:
+
+- **macOS:** abra **Ajustes do Sistema → Privacidade e Segurança** e clique em **Abrir
+  Mesmo Assim**. A cada versão nova, o macOS pede de novo as permissões de microfone e de
+  gravação de tela.
+- **Windows:** clique em **Mais informações → Executar assim mesmo**.
+
+## Como usar
+
+O **[tutorial](docs/tutorial.md)** mostra, com imagens, como instalar, fazer a primeira
+reunião, dar nome a quem fala, trocar de idioma, abrir a transcrição e gerenciar as vozes
+guardadas.
+
+## Publicar uma versão
+
+Atualize `version` em `src-tauri/tauri.conf.json` e envie a tag correspondente
+(`git tag v0.1.0 && git push origin v0.1.0`). O workflow `release` gera o `.dmg` do macOS
+e o instalador do Windows e cria a Release com os dois. Se a tag não bater com a versão,
+ele para com erro.
+
+Para desenvolver, veja as seções abaixo. Aplicativo desktop em Tauri 2 + React.
 
 ## Pré-requisitos
 
@@ -34,6 +52,7 @@ gera o `.dmg` e cria a Release. Se a tag não bater com a versão, ele para com 
   compilar: `export CMAKE_POLICY_VERSION_MINIMUM=3.5`
 - Node.js 20
 - macOS: Xcode Command Line Tools (`xcode-select --install`)
+- Windows: Visual Studio Build Tools com "Desenvolvimento para desktop com C++"
 
 ## Como rodar
 
