@@ -14,6 +14,8 @@ Aplicativo desktop em Tauri 2 + React. Etapa 1: macOS primeiro; Windows em segui
 **O áudio nunca é gravado em disco.** Só o texto (original e tradução) é salvo, e os logs
 não contêm o conteúdo das falas.
 
+Passo a passo de uso, com imagens: [docs/tutorial.md](docs/tutorial.md).
+
 ## Baixar (macOS, Apple Silicon)
 
 Cada versão publicada fica em **Releases** no GitHub, como `GOW Meet_<versão>_aarch64.dmg`.

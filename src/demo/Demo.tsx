@@ -47,7 +47,7 @@ const mainStates: Record<string, MainViewProps> = {
   "main-starting": {
     ...baseMain, phase: "starting", title: "Planejamento da sprint",
     progress: [
-      { file: "ggml-large-v3-turbo-q5_0.bin", done: 412e6, total: 574e6 },
+      { file: "ggml-small.en-q5_1.bin", done: 121e6, total: 190e6 },
       { file: "opus-mt-en-pt/model.bin", done: 61e6, total: 152e6 },
       { file: "opus-mt-en-pt/source.spm", done: 0.3e6, total: null },
     ],
