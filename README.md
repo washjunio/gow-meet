@@ -20,7 +20,7 @@ não contêm o conteúdo das falas.
 | Sistema | Arquivo |
 |---|---|
 | macOS 13 ou mais novo (Apple Silicon) | `GOW Meet_<versão>_aarch64.dmg` |
-| Windows 10/11 (64 bits) | `GOW Meet_<versão>_x64-setup.exe` (a partir da próxima versão) |
+| Windows 10/11 (64 bits) | `GOW Meet_<versão>_x64-setup.exe` |
 
 O app não tem assinatura da Apple nem da Microsoft, então o sistema avisa na primeira
 abertura:
@@ -39,7 +39,7 @@ guardadas.
 ## Publicar uma versão
 
 Atualize `version` em `src-tauri/tauri.conf.json` e envie a tag correspondente
-(`git tag v0.1.0 && git push origin v0.1.0`). O workflow `release` gera o `.dmg` do macOS
+(`git tag v0.1.1 && git push origin v0.1.1`). O workflow `release` gera o `.dmg` do macOS
 e o instalador do Windows e cria a Release com os dois. Se a tag não bater com a versão,
 ele para com erro.
 
